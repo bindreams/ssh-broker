@@ -533,6 +533,60 @@ pub fn recording(said: &std::cell::RefCell<Said>) -> impl FnMut(crate::provision
     |stream, text| said.borrow_mut().push((stream, text.to_owned()))
 }
 
+/// What the stand-in task and the tests around it record, in order: the calls on the task as `task: <call>`.
+pub type TaskLog = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+/// A stand-in for the Task Scheduler behind the sshd step: every call is pushed to `log` as `task: <call>`, and
+/// each answer is what the test sets.
+pub struct FakeSshdTask {
+    pub log: TaskLog,
+    pub register: Result<(), &'static str>,
+    pub run: Result<(), &'static str>,
+    pub wait: Result<crate::provision::schtasks::WaitOutcome, &'static str>,
+    pub report: Result<String, &'static str>,
+    pub remove: Result<(), &'static str>,
+}
+
+impl FakeSshdTask {
+    /// A task that works and whose step reported one note and closed its report.
+    pub fn new(log: &TaskLog) -> FakeSshdTask {
+        FakeSshdTask {
+            log: std::rc::Rc::clone(log),
+            register: Ok(()),
+            run: Ok(()),
+            wait: Ok(crate::provision::schtasks::WaitOutcome::Ended),
+            report: Ok(format!(
+                "sshd restarted; it accepts SSH_BROKER_ELEVATION\r\n{}\r\n",
+                crate::provision::sshd_task::REPORT_END
+            )),
+            remove: Ok(()),
+        }
+    }
+
+    fn call<T: Clone>(&self, name: &str, answer: &Result<T, &'static str>) -> anyhow::Result<T> {
+        self.log.borrow_mut().push(format!("task: {name}"));
+        answer.clone().map_err(|cause| anyhow::anyhow!("{cause}"))
+    }
+}
+
+impl crate::provision::sshd_task::SshdTask for FakeSshdTask {
+    fn register(&mut self) -> anyhow::Result<()> {
+        self.call("register", &self.register)
+    }
+    fn run(&mut self) -> anyhow::Result<()> {
+        self.call("run", &self.run)
+    }
+    fn wait(&mut self) -> anyhow::Result<crate::provision::schtasks::WaitOutcome> {
+        self.call("wait", &self.wait)
+    }
+    fn report(&mut self) -> anyhow::Result<String> {
+        self.call("report", &self.report)
+    }
+    fn remove(&mut self) -> anyhow::Result<()> {
+        self.call("remove", &self.remove)
+    }
+}
+
 /// A line the shell step prints states what happened and holds no advice: the how-to is in the README
 /// ("Shell configuration"), once.
 pub fn states_facts_only(text: &str) {

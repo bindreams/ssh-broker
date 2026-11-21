@@ -31,6 +31,7 @@ use super::restart::{ServiceState, StartOutcome, StopOutcome};
 use super::{DROP_IN_DIR_NAME, DROP_IN_NAME, SshdReading};
 use crate::acl;
 use crate::provision::procwait::Process;
+use crate::provision::sshd_task::LineKind;
 use crate::provision::{registry, system_config};
 
 mod listening;
@@ -460,14 +461,17 @@ fn system_time(filetime: FILETIME) -> anyhow::Result<SystemTime> {
 /// `install`'s sshd step on this machine: see [`configure`]. It never fails: what it could not do is said on
 /// `say`. An sshd that has not read the change is restarted through the service manager. Whether the running
 /// sshd takes the variable (or reads it when it next starts) is returned.
-pub fn configure_this_machine(say: &mut dyn FnMut(&str)) -> bool {
+pub fn configure_this_machine(say: &mut dyn FnMut(LineKind, &str)) -> bool {
     match Machine::find() {
         Ok(mut machine) => configure(&mut machine, say),
         Err(e) => {
-            say(&format!(
-                "install: cannot find sshd, so it was not set up to accept {}: {e:#}",
-                crate::protocol::ElevationPolicy::VARIABLE
-            ));
+            say(
+                LineKind::Warning,
+                &format!(
+                    "cannot find sshd, so it was not set up to accept {}: {e:#}",
+                    crate::protocol::ElevationPolicy::VARIABLE
+                ),
+            );
             false
         }
     }

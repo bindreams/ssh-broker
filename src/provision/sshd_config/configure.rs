@@ -21,6 +21,7 @@ use super::restart::{Before, ServiceState, StartOutcome, StopOutcome, restart};
 use super::{
     ACCEPT_LINE, DROP_IN_DIR_NAME, INCLUDE_LINE, VARIABLE, drop_in_text, in_force, include_elsewhere, with_line,
 };
+use crate::provision::sshd_task::LineKind;
 
 /// Why the drop-in folder or the drop-in cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,27 +163,34 @@ pub fn config_read(host: &mut dyn SshdHost) -> anyhow::Result<ConfigRead> {
     Ok(ConfigRead::Read)
 }
 
-/// Make sshd accept the variable, and say what was done on `say` (a line each). Returns whether the running
-/// sshd takes the variable, or reads it when it next starts (it is not running); false when it does not,
-/// because it could not be restarted to read the files or the variable could not be put in force, and when that
-/// cannot be told.
+/// Make sshd accept the variable, and say what was done on `say` (a line each, with its [`LineKind`]: a note says
+/// what the step did or found, a warning what the person must do or what the step could not do or find out).
+/// Returns whether the running sshd takes the variable, or reads it when it next starts (it is not running); false
+/// when it does not, because it could not be restarted to read the files or the variable could not be put in
+/// force, and when that cannot be told.
 ///
 /// A failed question to sshd writes nothing, and a candidate for `sshd_config` must pass sshd's checks before
 /// it replaces the original.
-pub fn configure(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool {
+pub fn configure(host: &mut dyn SshdHost, say: &mut dyn FnMut(LineKind, &str)) -> bool {
     if let Some(arguments) = host.service_arguments() {
-        say(&format!(
-            "install: the sshd service runs with arguments (`{arguments}`), which can name another configuration \
+        say(
+            LineKind::Warning,
+            &format!(
+                "the sshd service runs with arguments (`{arguments}`), which can name another configuration \
              file, so nothing of sshd's was changed. To have sshd accept {VARIABLE}, add `{ACCEPT_LINE}` above the \
              first `Match` in the file it reads and restart sshd; `ssh-broker elevate` works without it."
-        ));
+            ),
+        );
         return false;
     }
 
     let listing = match host.sshd_t(None) {
         Ok(listing) => listing,
         Err(e) => {
-            say(&ask_failed(host, &e, "nothing of sshd's was changed"));
+            say(
+                LineKind::Warning,
+                &ask_failed(host, &e, "nothing of sshd's was changed"),
+            );
             return false;
         }
     };
@@ -197,7 +205,10 @@ pub fn configure(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool {
             let listing = match host.sshd_t(None) {
                 Ok(listing) => listing,
                 Err(e) => {
-                    say(&ask_failed(host, &e, "sshd_config was left as it is"));
+                    say(
+                        LineKind::Warning,
+                        &ask_failed(host, &e, "sshd_config was left as it is"),
+                    );
                     return false;
                 }
             };
@@ -205,8 +216,8 @@ pub fn configure(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool {
                 match add_line(host, INCLUDE_LINE) {
                     Ok(original) => before.config = Some(original),
                     Err(why) => {
-                        say(&format!("install: sshd_config was not changed: {why}"));
-                        say(&advice(host));
+                        say(LineKind::Warning, &format!("sshd_config was not changed: {why}"));
+                        say(LineKind::Warning, &advice(host));
                         return false;
                     }
                 }
@@ -215,22 +226,23 @@ pub fn configure(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool {
         Err(problem) => {
             let folder = host.config_path().with_file_name(DROP_IN_DIR_NAME);
             let left = match problem {
-                DropInProblem::NotMade(cause) => format!("install: {} could not be made ({cause})", folder.display()),
+                DropInProblem::NotMade(cause) => format!("{} could not be made ({cause})", folder.display()),
                 DropInProblem::Refused(problem) => {
-                    format!("install: {} is left as it is ({problem})", folder.display())
+                    format!("{} is left as it is ({problem})", folder.display())
                 }
             };
             match add_line(host, ACCEPT_LINE) {
                 Ok(original) => {
                     before.config = Some(original);
-                    say(&format!(
-                        "{left}; {VARIABLE} is accepted by a line in sshd_config instead"
-                    ));
+                    say(
+                        LineKind::Warning,
+                        &format!("{left}; {VARIABLE} is accepted by a line in sshd_config instead"),
+                    );
                 }
                 Err(why) => {
-                    say(&left);
-                    say(&format!("install: sshd_config was not changed: {why}"));
-                    say(&advice(host));
+                    say(LineKind::Warning, &left);
+                    say(LineKind::Warning, &format!("sshd_config was not changed: {why}"));
+                    say(LineKind::Warning, &advice(host));
                     return false;
                 }
             }
@@ -244,7 +256,7 @@ pub fn configure(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool {
 /// next `install` stops at the same place, so the advice is to add the line by hand, not to run `install` again.
 fn ask_failed(host: &dyn SshdHost, cause: &anyhow::Error, left: &str) -> String {
     format!(
-        "install: could not ask sshd for its configuration ({cause:#}), so {left}. To have sshd accept {VARIABLE}, \
+        "could not ask sshd for its configuration ({cause:#}), so {left}. To have sshd accept {VARIABLE}, \
          add `{ACCEPT_LINE}` above the first `Match` in {} and restart sshd; `ssh-broker elevate` works without it.",
         host.config_path().display()
     )
@@ -254,7 +266,7 @@ fn ask_failed(host: &dyn SshdHost, cause: &anyhow::Error, left: &str) -> String 
 /// `install` finds the line in force and restarts sshd, if it has not read it.
 fn advice(host: &dyn SshdHost) -> String {
     format!(
-        "install: add `{ACCEPT_LINE}` above the first `Match` in {}, then run `ssh-broker install` again, which \
+        "add `{ACCEPT_LINE}` above the first `Match` in {}, then run `ssh-broker install` again, which \
          restarts sshd; `ssh-broker elevate` works without it",
         host.config_path().display()
     )
@@ -279,48 +291,64 @@ fn write_drop_in(host: &mut dyn SshdHost, before: &mut Before) -> Result<(), Dro
 /// judged, and an `Include` of another location, restart it to be sure. `before` is what this run changed: a
 /// change sshd cannot have read restarts it even when the times cannot be read, and is put back if sshd cannot
 /// start with it.
-fn say_whether_read(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Before) -> bool {
+fn say_whether_read(host: &mut dyn SshdHost, say: &mut dyn FnMut(LineKind, &str), before: &Before) -> bool {
     match config_read(host) {
         Ok(ConfigRead::Read) => true,
         Ok(ConfigRead::NotRunning) => {
-            say("install: sshd is not running; it reads the change when it starts");
+            say(
+                LineKind::Warning,
+                "sshd is not running; it reads the change when it starts",
+            );
             true
         }
         Ok(ConfigRead::Unread(file)) => {
-            say(&format!(
-                "install: sshd was started before {} was last changed, so it has not read it",
-                file.display()
-            ));
+            say(
+                LineKind::Note,
+                &format!(
+                    "sshd was started before {} was last changed, so it has not read it",
+                    file.display()
+                ),
+            );
             restart(host, say, before)
         }
         Ok(ConfigRead::AheadOfClock(file)) => {
-            say(&format!(
-                "install: {}'s change time is ahead of this machine's clock, so it cannot be told whether sshd \
-                 has read it",
-                file.display()
-            ));
+            say(
+                LineKind::Warning,
+                &format!(
+                    "{}'s change time is ahead of this machine's clock, so it cannot be told whether sshd has read it",
+                    file.display()
+                ),
+            );
             restart(host, say, before)
         }
         Ok(ConfigRead::IncludesOther { file, line }) => {
-            say(&format!(
-                "install: {} has `{line}`; files sshd includes from elsewhere are not judged, so it cannot be told \
-                 whether sshd has read its configuration, and it is restarted to be sure it accepts {VARIABLE}",
-                file.display()
-            ));
+            say(
+                LineKind::Warning,
+                &format!(
+                    "{} has `{line}`; files sshd includes from elsewhere are not judged, so it cannot be told \
+                     whether sshd has read its configuration, and it is restarted to be sure it accepts {VARIABLE}",
+                    file.display()
+                ),
+            );
             restart(host, say, before)
         }
         Err(e) if before.changed() => {
-            say(&format!(
-                "install: cannot tell whether sshd has read its configuration ({e:#}); this run changed it, so it \
-                 has not"
-            ));
+            say(
+                LineKind::Warning,
+                &format!(
+                    "cannot tell whether sshd has read its configuration ({e:#}); this run changed it, so it has not"
+                ),
+            );
             restart(host, say, before)
         }
         Err(e) => {
-            say(&format!(
-                "install: cannot tell whether sshd has read its configuration ({e:#}); restart the sshd service for \
-                 it to accept {VARIABLE}"
-            ));
+            say(
+                LineKind::Warning,
+                &format!(
+                    "cannot tell whether sshd has read its configuration ({e:#}); restart the sshd service for it to \
+                     accept {VARIABLE}"
+                ),
+            );
             false
         }
     }

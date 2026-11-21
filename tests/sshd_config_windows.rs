@@ -70,20 +70,21 @@ use stand_in::Kit;
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-/// What `install`'s sshd step did and said: whether the running sshd takes the variable, and its lines.
+/// What `install`'s sshd step did and said: whether the running sshd takes the variable, and its lines as the
+/// report holds them (a warning begins with `warning: `, a note with nothing).
 fn configure() -> (bool, Vec<String>) {
     let mut said = Vec::new();
-    let accepted = configure_this_machine(&mut |line| said.push(line.to_owned()));
+    let accepted = configure_this_machine(&mut |kind, text| said.push(sshd_task::render(kind, text)));
     (accepted, said)
 }
 
 /// A step that changed a file of sshd's configuration under a running sshd: it restarted the service, and says
-/// that sshd restarted and accepts the variable.
+/// in a note that sshd restarted and accepts the variable.
 fn assert_restarted(accepted: bool, said: &[String]) {
     assert!(accepted, "{said:#?}");
     assert_eq!(
         said.last().expect("the step said nothing"),
-        "install: sshd restarted; it accepts SSH_BROKER_ELEVATION",
+        "sshd restarted; it accepts SSH_BROKER_ELEVATION",
         "{said:#?}"
     );
 }
@@ -159,6 +160,15 @@ fn report() -> sshd_task::Report {
     sshd_task::Report::parse(&text)
 }
 
+/// The lines of `report`, as the report file holds them.
+fn rendered(report: &sshd_task::Report) -> Vec<String> {
+    report
+        .lines
+        .iter()
+        .map(|line| sshd_task::render(line.kind, &line.text))
+        .collect()
+}
+
 /// No task of the sshd step is left registered.
 fn assert_no_sshd_task_is_left() {
     assert_eq!(
@@ -177,9 +187,9 @@ fn system_cmd() -> PathBuf {
 
 /// The step on the runner's stock file, run by `install` through its task, as SYSTEM: the drop-in, the `Include` line
 /// above the first `Match`, the original's security on the replacement (SYSTEM can create the drop-in and
-/// `copy_file_security` works as SYSTEM), and the restart of sshd. No task is left after `install`, and the report
-/// holds the lines `install` printed after it said the step was the task's. After the restart the `doctor` row
-/// passes and a second run says nothing.
+/// `copy_file_security` works as SYSTEM), and the restart of sshd. No task is left after `install`. `install` says
+/// the step line, last before the installed line, and prints on standard error the warnings of the report and none
+/// of its notes. After the restart the `doctor` row passes and a second run says nothing.
 #[test]
 fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_the_row_passes() {
     let _machine = machine::exclusive();
@@ -190,21 +200,37 @@ fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_an
     let kit = Kit::broker_with_helper("sshs");
     let security_before = sddl_of(&config_path());
 
-    let (stdout, _) = install_streams(&kit);
+    let (stdout, stderr) = install_streams(&kit);
     let installed = installed_line(version());
+    let out_lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(
-        stdout.lines().last(),
-        Some(installed.as_str()),
+        out_lines.last(),
+        Some(&installed.as_str()),
         "install's last line says it is installed:\n{stdout}"
     );
-    let printed: Vec<&str> = stdout
-        .lines()
-        .skip_while(|line| !line.starts_with(sshd_task::HANDED_OVER_PREFIX))
-        .skip(1)
-        .take_while(|line| *line != installed)
-        .collect();
-    let said = report().lines;
-    assert_eq!(printed, said, "install prints the report, line for line");
+    assert!(
+        out_lines[out_lines.len() - 2].starts_with(sshd_task::HANDED_OVER_PREFIX),
+        "the step line is the last before the installed line:\n{stdout}"
+    );
+    let report = report();
+    let warnings: Vec<&str> = report.warnings().collect();
+    let err_lines: Vec<&str> = stderr.lines().collect();
+    assert!(
+        err_lines.ends_with(&warnings),
+        "install prints the warnings of the report, last on standard error:\n{stderr}\n{warnings:#?}"
+    );
+    for note in report
+        .lines
+        .iter()
+        .filter(|line| line.kind == sshd_task::LineKind::Note)
+    {
+        assert!(
+            !stdout.contains(&note.text) && !stderr.contains(&note.text),
+            "install printed a note of the report: {}",
+            note.text
+        );
+    }
+    let said = rendered(&report);
     assert_restarted(true, &said);
     assert_no_sshd_task_is_left();
     assert_eq!(
@@ -1032,9 +1058,9 @@ fn an_install_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_
         report.lines
     );
     assert_eq!(
-        report.lines.last().map(String::as_str),
-        Some("install: sshd restarted; it accepts SSH_BROKER_ELEVATION"),
-        "the report's last line says sshd restarted"
+        rendered(&report).last().map(String::as_str),
+        Some("sshd restarted; it accepts SSH_BROKER_ELEVATION"),
+        "the report's last line is the note that says sshd restarted"
     );
 
     // A new login gets the variable: the rig is made after the checks above, so that it cannot have configured

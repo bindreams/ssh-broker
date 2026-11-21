@@ -1,7 +1,10 @@
 use super::*;
-use crate::test_support::{Said, recording, silent};
+use crate::provision::sshd_task::{LineKind, REPORT_END, hand_over, render};
+use crate::test_support::{FakeSshdTask, Said, recording, silent};
 use anyhow::Context;
 use std::cell::RefCell;
+use std::path::Path;
+use std::rc::Rc;
 
 /// Run the flow with a `set_up` that stops (or not) and then fails (or not); return the
 /// events in order and the result.
@@ -597,7 +600,7 @@ fn the_last_thing_install_says_is_the_installed_line_on_stdout() {
             say(Stream::Err, "a warning");
             Ok(())
         },
-        |(), say| say("a line of the sshd step"),
+        |(), say| say(Stream::Out, "a line of the sshd step"),
     )
     .unwrap();
     assert_eq!(
@@ -869,8 +872,14 @@ fn the_path_is_announced_before_it_is_written_and_the_programs_told_after() {
     assert!(told, "the running programs hear of the change");
 }
 
+const EXE: &str = r"C:\ProgramData\ssh-broker\ssh-broker.exe";
+const REPORT: &str = r"C:\ProgramData\ssh-broker\install-sshd.log";
+const NOTE_OF_THE_STEP: &str = "sshd is not running; it reads the change when it starts";
+const WARNING_OF_THE_STEP: &str = "add `AcceptEnv SSH_BROKER_ELEVATION` above the first `Match` in sshd_config";
+
 /// The lines of a first install on a machine with trouble at every step that goes on: the waits, the PATH, the
-/// agents and the sessions. The sshd step is a stand-in that says nothing: its lines are not this module's.
+/// agents and the sessions, and an sshd step that is the real hand-over over a stand-in task whose report holds a
+/// note and a warning.
 fn what_a_troubled_install_says() -> Said {
     let said = RefCell::new(Vec::new());
     install_run(
@@ -918,13 +927,23 @@ fn what_a_troubled_install_says() -> Said {
                 },
             )
         },
-        |_, _| {},
+        |_, say| {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut task = FakeSshdTask::new(&log);
+            task.report = Ok(format!(
+                "{}\r\n{}\r\n{REPORT_END}\r\n",
+                render(LineKind::Note, NOTE_OF_THE_STEP),
+                render(LineKind::Warning, WARNING_OF_THE_STEP)
+            ));
+            hand_over(&mut task, Path::new(REPORT), Path::new(EXE), say);
+        },
     )
     .unwrap();
     said.into_inner()
 }
 
-/// stdout carries the step lines and the last line, and every step line says that it is going on.
+/// stdout carries the step lines and the last line, and every step line says that it is going on, the sshd
+/// step's included.
 #[test]
 fn every_stdout_line_but_the_last_ends_in_three_dots() {
     let said = what_a_troubled_install_says();
@@ -945,7 +964,27 @@ fn every_stdout_line_but_the_last_ends_in_three_dots() {
     );
 }
 
-/// No line this module says begins with `install`.
+/// The sshd step of a troubled install says its step line on stdout, after the lines of the steps before it, and
+/// the warning of its report on stderr; its note stays in the report.
+#[test]
+fn the_sshd_step_says_its_step_line_and_its_warning_and_not_its_note() {
+    let said = what_a_troubled_install_says();
+    let step_line = out(&crate::provision::sshd_task::step_line(Path::new(EXE)));
+    let at = said.iter().position(|line| *line == step_line).expect("the step line");
+    assert_eq!(said[at + 1], err(WARNING_OF_THE_STEP));
+    assert_eq!(said.last(), Some(&out(INSTALLED)));
+    assert_eq!(
+        said.len(),
+        at + 3,
+        "the step line, the warning and the last line close the install"
+    );
+    assert!(
+        said.iter().all(|(_, line)| !line.contains(NOTE_OF_THE_STEP)),
+        "{said:#?}"
+    );
+}
+
+/// No line `install` says, the sshd step's included, begins with `install`.
 #[test]
 fn no_line_begins_with_the_verb() {
     let said = what_a_troubled_install_says();
