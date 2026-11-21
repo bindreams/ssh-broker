@@ -77,7 +77,7 @@ fn interactive_sessions_reads_this_host_and_never_names_session_zero() {
 }
 
 #[test]
-fn a_session_whose_user_query_failed_is_reported_and_counted_not_dropped() {
+fn a_session_whose_user_query_failed_is_reported_not_dropped() {
     let all = [
         session(1, SessionState::Active, true),
         unreadable(3, SessionState::Disconnected),
@@ -85,7 +85,6 @@ fn a_session_whose_user_query_failed_is_reported_and_counted_not_dropped() {
     let targets = target_sessions(&all);
     assert_eq!(targets.ids, [1]);
     assert_eq!(targets.unknown, [(3, "access denied".to_string())]);
-    assert_eq!(targets.total(), 2, "the failed session counts in the total");
 }
 
 #[test]

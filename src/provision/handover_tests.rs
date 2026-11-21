@@ -4,11 +4,11 @@
 use std::cell::Cell;
 use std::path::Path;
 
-use super::{Handover, Stream, hand_over, remove_arguments, replace_shell, say_to};
+use super::{Handover, Stream, hand_over, remove_arguments, replace_shell, say_line_to, say_to};
 use crate::provision::registry::{SshdShell, SshdShellReading};
 use crate::provision::system_config::{ConfigKind, CreateOutcome, Decision, Skip, decide};
 use crate::shell::config::ShellBlock;
-use crate::test_support::{ClosedStream, states_facts_only};
+use crate::test_support::{ClosedStream, show_to_closed_stderr, states_facts_only};
 
 const PWSH7: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
 const CONFIG: &str = r"C:\ProgramData\ssh-broker\config.yaml";
@@ -24,8 +24,8 @@ fn previous() -> SshdShell {
 
 /// A handover for the tests that stand in for `carry` and look at its order, not at what it proves. The
 /// field is private to `handover`, which this module is inside.
-fn a_handover() -> Handover {
-    Handover(())
+fn a_handover() -> anyhow::Result<Handover> {
+    Ok(Handover(()))
 }
 
 fn block() -> ShellBlock {
@@ -44,8 +44,9 @@ fn said_for(
     create: impl FnOnce(&ShellBlock) -> anyhow::Result<CreateOutcome>,
 ) -> Vec<(Stream, String)> {
     let mut lines = Vec::new();
-    let _ = hand_over(Path::new(CONFIG), previous, decision, create, &mut |stream, text| {
-        lines.push((stream, text.to_owned()))
+    let _ = hand_over(Path::new(CONFIG), previous, decision, create, &mut |text| {
+        lines.push((Stream::Err, text.to_owned()));
+        Ok(())
     });
     lines
 }
@@ -122,16 +123,89 @@ fn no_notice_begins_with_the_verb_and_every_one_is_on_stderr() {
     }
 }
 
-/// The closed standard streams of a service or of a dropped SSH connection lose a line and nothing else.
+/// The one writer reports a failed write, and writes to the stream it is told to; the sink for lines loses a line
+/// whose write failed, and writes the rest.
 #[test]
-fn a_notice_to_a_closed_stream_is_lost_and_nothing_else() {
-    say_to(&mut ClosedStream, &mut ClosedStream, Stream::Out, "a line");
-    say_to(&mut ClosedStream, &mut ClosedStream, Stream::Err, "a line");
+fn a_failed_write_is_reported_by_say_to_and_a_line_that_was_lost_is_lost_by_the_sink_for_lines() {
+    assert!(say_to(&mut ClosedStream, &mut ClosedStream, Stream::Out, "a line").is_err());
+    assert!(say_to(&mut ClosedStream, &mut ClosedStream, Stream::Err, "a line").is_err());
+    // Only the stream asked for matters.
+    let mut open = Vec::new();
+    say_to(&mut ClosedStream, &mut open, Stream::Err, "a line").unwrap();
+    assert_eq!(open, b"a line\n");
+
+    say_line_to(&mut ClosedStream, &mut ClosedStream, Stream::Out, "a line");
+    say_line_to(&mut ClosedStream, &mut ClosedStream, Stream::Err, "a line");
 
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    say_to(&mut out, &mut err, Stream::Out, "to stdout");
-    say_to(&mut out, &mut err, Stream::Err, "to stderr");
+    say_line_to(&mut out, &mut err, Stream::Out, "to stdout");
+    say_line_to(&mut out, &mut err, Stream::Err, "to stderr");
     assert_eq!((out, err), (b"to stdout\n".to_vec(), b"to stderr\n".to_vec()));
+}
+
+/// The notice that is the only record of a value is not a line: a standard error that cannot be written gives
+/// no proof that the previous shell's values were shown, and the shell is not replaced. The error names the cause
+/// and what was kept.
+#[test]
+fn a_previous_shell_whose_values_could_not_be_shown_gets_no_handover() {
+    let write = |created: anyhow::Result<CreateOutcome>| (Decision::Write(block()), created);
+    let skip = |skip| (Decision::Skip(skip), Ok(CreateOutcome::Created));
+    for (decision, created) in [
+        skip(Skip::FileExists),
+        skip(Skip::NotAFile),
+        skip(Skip::NothingToCarry),
+        skip(Skip::Unchecked("cannot tell whether the config exists".into())),
+        write(Err(anyhow::anyhow!("disk full"))),
+        write(Ok(CreateOutcome::FileExists)),
+        write(Ok(CreateOutcome::NotAFile)),
+    ] {
+        let label = format!("{decision:?}");
+        let text = match hand_over(
+            Path::new(CONFIG),
+            &previous(),
+            decision,
+            |_| created,
+            &mut show_to_closed_stderr,
+        ) {
+            Ok(_) => panic!("{label}: the values were not shown, and a proof was given"),
+            Err(e) => format!("{e:#}"),
+        };
+        for part in [
+            "could not be shown",
+            "broken pipe",
+            "nothing was replaced",
+            &format!("DefaultShell is still \"{PWSH7}\""),
+        ] {
+            assert!(text.contains(part), "{label}: {part}: {text}");
+        }
+        states_facts_only(&text);
+    }
+}
+
+/// A config that holds the previous values is the record, so no notice is needed and a closed standard error
+/// changes nothing.
+#[test]
+fn a_config_that_was_written_needs_no_notice_and_gets_its_handover_whatever_standard_error_does() {
+    assert!(
+        hand_over(
+            Path::new(CONFIG),
+            &previous(),
+            Decision::Write(block()),
+            |_| Ok(CreateOutcome::Created),
+            &mut show_to_closed_stderr,
+        )
+        .is_ok()
+    );
+    assert!(
+        hand_over(
+            Path::new(CONFIG),
+            &SshdShell::none(),
+            Decision::Skip(Skip::NothingToCarry),
+            |_| unreachable!(),
+            &mut show_to_closed_stderr,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -340,6 +414,34 @@ fn a_failed_flip_is_the_error_and_says_the_default_shell_was_not_changed() {
     states_facts_only(&text);
 }
 
+/// The rule at the flip: values that were neither carried nor shown stop `install` before `DefaultShell` is written,
+/// whatever the reason they were not shown, and the error is the one `carry` gave.
+#[test]
+fn a_carry_that_could_not_show_the_values_stops_before_the_flip() {
+    let flipped = Cell::new(false);
+    let error = replace_shell(
+        || reading().into_shell("location"),
+        |previous| {
+            hand_over(
+                Path::new(CONFIG),
+                previous,
+                Decision::Skip(Skip::FileExists),
+                |_| unreachable!(),
+                &mut show_to_closed_stderr,
+            )
+        },
+        |_| {
+            flipped.set(true);
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(!flipped.get(), "DefaultShell was written with the values unseen");
+    let text = format!("{error:#}");
+    assert!(text.contains("could not be shown"), "{text}");
+    assert_eq!(text.matches("nothing was replaced").count(), 1, "{text}");
+}
+
 fn unreadable_arguments(shell: &str) -> SshdShellReading {
     let mut reading = reading();
     reading.shell = Ok(Some(shell.into()));
@@ -403,8 +505,45 @@ fn removal(
             Ok(())
         },
         &mut |stream, text| events.borrow_mut().push(Event::Said(stream, text.to_owned())),
-    );
+        &mut |text| {
+            events.borrow_mut().push(Event::Said(Stream::Err, text.to_owned()));
+            Ok(())
+        },
+    )
+    .unwrap();
     events.into_inner()
+}
+
+/// The value is deleted only after it was shown: a standard error that cannot be written shows nothing, so the
+/// value stays and `install` stops with the reason, naming what was kept.
+#[test]
+fn arguments_that_could_not_be_shown_are_not_removed() {
+    let removed = Cell::new(false);
+    let said = std::cell::RefCell::new(Vec::new());
+    let result = remove_arguments(
+        Path::new(CONFIG),
+        KEY,
+        Ok(Some("-NoLogo".to_owned())),
+        || Ok(ConfigKind::File),
+        |_shown| {
+            removed.set(true);
+            Ok(())
+        },
+        &mut |stream, text| said.borrow_mut().push((stream, text.to_owned())),
+        &mut show_to_closed_stderr,
+    );
+    assert!(!removed.get(), "the value was deleted without being shown");
+    let text = format!("{:#}", result.unwrap_err());
+    for part in [
+        "DefaultShellArguments could not be shown",
+        "broken pipe",
+        "nothing was removed",
+        r"it is still set in HKLM\SOFTWARE\OpenSSH",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    states_facts_only(&text);
+    assert_eq!(*said.borrow(), [], "the notice is not a line");
 }
 
 /// The owner's rule (7/7), applied to the value that is deleted: the text with the value is emitted

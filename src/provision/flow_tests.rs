@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::{Said, recording, say_to_closed_streams, show_to_closed_stderr, silent};
 use anyhow::Context;
 use std::cell::RefCell;
 
@@ -23,7 +24,7 @@ fn flow_resuming(
 ) -> (Vec<&'static str>, anyhow::Result<()>) {
     let events = RefCell::new(Vec::new());
     let result = run(
-        &mut quiet,
+        &mut silent,
         || {
             events.borrow_mut().push("stop");
             stop_result()
@@ -52,17 +53,6 @@ fn flow_resuming(
     (events.into_inner(), result)
 }
 
-/// A sink for the tests that do not look at what is said.
-fn quiet(_: Stream, _: &str) {}
-
-/// What was said, in order, with the stream of each line.
-type Said = Vec<(Stream, String)>;
-
-/// A sink that records into `said`.
-fn recording(said: &RefCell<Said>) -> impl FnMut(Stream, &str) + '_ {
-    |stream, text| said.borrow_mut().push((stream, text.to_owned()))
-}
-
 #[test]
 fn agents_start_after_a_successful_install() {
     let (events, result) = flow(true, || Ok(()), true);
@@ -87,7 +77,7 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
     }];
     let told = RefCell::new(Vec::new());
     let result = run(
-        &mut quiet,
+        &mut silent,
         || Err(StillRunning::new(left.clone(), std::time::Duration::from_secs(60)).into()),
         |stop, _| {
             stop().context("stop the running agents")?;
@@ -451,10 +441,10 @@ impl Machine {
     }
 
     fn repair(&self) -> anyhow::Result<()> {
-        self.repair_saying(&mut quiet)
+        self.repair_saying(&mut silent)
     }
 
-    fn repair_saying(&self, say: &mut dyn FnMut(Stream, &str)) -> anyhow::Result<()> {
+    fn repair_saying(&self, say: &mut Say<'_>) -> anyhow::Result<()> {
         repair_sessions(
             say,
             || {
@@ -529,7 +519,7 @@ fn a_task_that_cannot_be_started_does_not_fail_the_repair_or_hold_back_the_other
 #[test]
 fn a_listing_of_the_tasks_that_fails_is_the_result() {
     let result = repair_sessions(
-        &mut quiet,
+        &mut silent,
         || anyhow::bail!("service unreachable"),
         |_| Ok(()),
         |_| Ok(false),
@@ -542,7 +532,6 @@ fn a_listing_of_the_tasks_that_fails_is_the_result() {
 
 use crate::provision::path_env::Stored;
 use crate::provision::sessions::Targets;
-use crate::test_support::ClosedStream;
 
 const DIR: &str = r"C:\ProgramData\ssh-broker";
 const INSTALLING: &str = "Installing ssh-broker v0.2.0 for every user of this PC...";
@@ -661,38 +650,100 @@ fn what_the_install_holds_is_held_through_the_sshd_step() {
     assert_eq!(events.into_inner(), ["sshd step", "installed line", "released"]);
 }
 
-#[test]
-fn a_closed_stream_does_not_end_the_install() {
+/// `install_run` over `say`: its result, and what each step was called with and did.
+fn install_run_saying(say: &mut Say<'_>, body_fails: bool) -> (Result<(), String>, Vec<String>) {
     let ran = RefCell::new(Vec::new());
-    let mut closed =
-        |stream, text: &str| crate::provision::handover::say_to(&mut ClosedStream, &mut ClosedStream, stream, text);
-    let run_with = |say: &mut dyn FnMut(Stream, &str), body_fails: bool| {
-        install_run(
-            say,
-            "0.2.0",
-            |say| {
-                ran.borrow_mut().push("body");
-                say(Stream::Out, "A step...");
-                say(Stream::Err, "a warning");
-                anyhow::ensure!(!body_fails, "copy failed");
-                Ok(())
-            },
-            |(), say| {
-                ran.borrow_mut().push("sshd step");
-                say("a line of the sshd step")
-            },
-        )
-        .map_err(|e| format!("{e:#}"))
-    };
+    let result = install_run(
+        say,
+        "0.2.0",
+        |say| {
+            ran.borrow_mut().push("body".to_owned());
+            say(Stream::Out, "A step...");
+            say(Stream::Err, "a warning");
+            anyhow::ensure!(!body_fails, "copy failed");
+            Ok(7)
+        },
+        |held, say| {
+            ran.borrow_mut().push(format!("sshd step with {held}"));
+            say("a line of the sshd step")
+        },
+    )
+    .map_err(|e| format!("{e:#}"));
+    (result, ran.into_inner())
+}
 
+/// A line lost to a closed stream (an `install` over an SSH connection that has gone) is lost and that is all: the
+/// result of `install_run` and what its steps are called with are what they are over a stream that works.
+#[test]
+fn a_line_lost_to_a_closed_stream_changes_nothing_but_the_line() {
     let working = RefCell::new(Vec::new());
-    assert_eq!(run_with(&mut closed, false), run_with(&mut recording(&working), false));
-    assert_eq!(*ran.borrow(), ["body", "sshd step", "body", "sshd step"]);
+    for body_fails in [false, true] {
+        assert_eq!(
+            install_run_saying(&mut say_to_closed_streams, body_fails),
+            install_run_saying(&mut recording(&working), body_fails),
+            "body_fails: {body_fails}"
+        );
+    }
     assert_eq!(
-        run_with(&mut closed, true),
-        run_with(&mut recording(&working), true),
-        "a failed install fails with its own error, not with the closed stream's"
+        install_run_saying(&mut say_to_closed_streams, false),
+        (Ok(()), vec!["body".to_owned(), "sshd step with 7".to_owned()],)
     );
+}
+
+/// The notice that is the only record of the previous shell's values is not a line: with a standard error that
+/// cannot be written `DefaultShell` is not flipped, the install fails with that, the agents it stopped start again
+/// as after any failed step, and no installed line is said.
+#[test]
+fn a_notice_that_could_not_be_shown_stops_the_flip_and_the_install() {
+    use crate::provision::handover::{hand_over, replace_shell};
+    use crate::provision::registry::SshdShell;
+    use crate::provision::system_config::{Decision, Skip};
+
+    let events = RefCell::new(Vec::new());
+    let said = RefCell::new(Vec::new());
+    let foreign = SshdShell {
+        shell: Some(r"C:\Program Files\PowerShell\7\pwsh.exe".into()),
+        command_option: Some("-NoLogo -c".into()),
+        arguments: Some("-NoProfile".into()),
+        escape_arguments: false,
+    };
+    let result = install_run(
+        &mut recording(&said),
+        "0.2.0",
+        |say| {
+            run(
+                say,
+                || Ok(()),
+                |stop, _| {
+                    stop()?;
+                    replace_shell(
+                        || Ok(foreign),
+                        |previous| {
+                            hand_over(
+                                std::path::Path::new(r"C:\ProgramData\ssh-broker\config.yaml"),
+                                previous,
+                                Decision::Skip(Skip::FileExists),
+                                |_| unreachable!(),
+                                &mut show_to_closed_stderr,
+                            )
+                        },
+                        |_| {
+                            events.borrow_mut().push("flip");
+                            Ok(())
+                        },
+                    )
+                },
+                || Ok(()),
+                |_| Ok(()),
+                |_, _| events.borrow_mut().push("start"),
+            )
+        },
+        |_, _| panic!("the sshd step comes only after the install worked"),
+    );
+    let text = format!("{:#}", result.unwrap_err());
+    assert!(text.contains("could not be shown"), "{text}");
+    assert_eq!(*events.borrow(), ["start"], "no flip, and the agents come back");
+    assert_eq!(*said.borrow(), [out(INSTALLING)]);
 }
 
 #[test]
@@ -722,6 +773,11 @@ fn started(targets: anyhow::Result<Targets>, survivors: &[Survivor], unstartable
         &mut recording(&said),
         || targets,
         |id| {
+            assert_eq!(
+                said.borrow().iter().filter(|line| **line == out(STARTING)).count(),
+                1,
+                "the line is said once, before the first agent is started"
+            );
             anyhow::ensure!(!unstartable.contains(&id), "no such task");
             starts.push(id);
             Ok(())
@@ -761,12 +817,12 @@ fn every_line_that_was_on_stderr_is_still_said_there() {
     assert_eq!(
         said,
         [
-            out(STARTING),
             err("could not tell whether session 3 has a user, so no agent was started there: access denied"),
             err(
                 "no agent was started in session 2: its old agent (process 5, 6) was stopped but has not been seen to \
                  exit; run install again once it has exited"
             ),
+            out(STARTING),
             err("could not start the agent in session 4: no such task"),
         ]
     );
@@ -774,10 +830,7 @@ fn every_line_that_was_on_stderr_is_still_said_there() {
     let (said, _) = started(Err(anyhow::anyhow!("the service is down")), &[], &[]);
     assert_eq!(
         said,
-        [
-            out(STARTING),
-            err("the logged-on sessions could not be listed: the service is down")
-        ]
+        [err("the logged-on sessions could not be listed: the service is down")]
     );
 
     // `add_install_dir_to_path`
@@ -879,6 +932,24 @@ fn a_step_that_does_not_happen_says_nothing() {
     )
     .unwrap();
     assert_eq!(said.into_inner(), []);
+    // No agent is started when no session is logged on, or when every session is held by an agent that has not
+    // exited: no line says that one is. A session that could not be told, or one that is held, is said and is
+    // not a start.
+    let (said, starts) = started(Ok(Targets::default()), &[], &[]);
+    assert_eq!((said, starts), (vec![], vec![]));
+    let targets = Targets {
+        ids: vec![2],
+        unknown: vec![(3, "access denied".into())],
+    };
+    let (said, starts) = started(Ok(targets), &[survivor(5, 2)], &[]);
+    assert_eq!(starts, Vec::<u32>::new());
+    assert!(!said.contains(&out(STARTING)), "{said:?}");
+    assert_eq!(said.len(), 2, "{said:?}");
+    // Nor when the sessions could not be listed: that is said, and nothing starts.
+    let (said, starts) = started(Err(anyhow::anyhow!("the service is down")), &[], &[]);
+    assert_eq!(starts, Vec::<u32>::new());
+    assert!(!said.contains(&out(STARTING)), "{said:?}");
+    assert_eq!(said.len(), 1, "{said:?}");
 }
 
 #[test]

@@ -3,17 +3,12 @@
 
 use anyhow::Context;
 
-use super::handover::Stream;
+use super::handover::{Say, Stream};
 use super::path_env;
 use super::procwait::{self, StillRunning, Survivor};
 use super::schtasks::{INSTALL_SSHD_TASK, WaitOutcome, end_and_remove_install_sshd_task};
 use super::sessions::Targets;
 use super::sshd_config::CHECK_SSHD;
-
-/// The lines of `install` go to one sink: a `say` that takes the stream and the line. A step line (it ends in
-/// `...`, is said before the step starts and goes to stdout) says what is about to take a while; a warning goes to
-/// stderr and says what the person must know.
-pub type Say<'a> = dyn FnMut(Stream, &str) + 'a;
 
 /// Run `install`: say that it starts, run `body` (everything up to the sshd step, which gives back what must be
 /// held until the end, the lock), run `sshd_step` with a sink for its lines, then say that ssh-broker has been
@@ -244,14 +239,14 @@ pub fn repair_sessions(
 /// the stop ended. `start_in` starts the agent in one session; an agent that is already running in its session
 /// exits at once, so this is safe to repeat. Best-effort: the install is complete without it, and a failed
 /// `install` runs it too. A session whose old agent survived the stop is left alone: see [`plan_start`]. Each
-/// failure is said on stderr and the rest go on.
+/// failure is said on stderr and the rest go on. The step line is said once, right before the first agent is
+/// started, and not at all when no session gets one.
 pub fn start_agents(
     say: &mut Say<'_>,
     interactive: impl FnOnce() -> anyhow::Result<Targets>,
     mut start_in: impl FnMut(u32) -> anyhow::Result<()>,
     survivors: &[Survivor],
 ) {
-    say(Stream::Out, "Starting an agent in each logged-on session...");
     let targets = match interactive() {
         Ok(targets) => targets,
         Err(e) => {
@@ -277,6 +272,9 @@ pub fn start_agents(
                 pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
             ),
         );
+    }
+    if !plan.start.is_empty() {
+        say(Stream::Out, "Starting an agent in each logged-on session...");
     }
     for id in &plan.start {
         if let Err(e) = start_in(*id) {

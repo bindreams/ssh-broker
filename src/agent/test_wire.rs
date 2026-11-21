@@ -110,6 +110,13 @@ impl HalfClose for Wire {
     }
 }
 
+/// The write half of a connection whose peer has gone: every write fails, and the FIN has nothing to do.
+impl HalfClose for crate::test_support::ClosedStream {
+    fn shutdown_write(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 /// A target that records what it was given.
 #[derive(Default)]
 pub(super) struct Recorder {

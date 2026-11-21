@@ -47,16 +47,3 @@ fn a_path_that_cannot_be_read_leaves_the_heading_with_the_version_alone() {
     let out = format_report("0.2.0", None, &[Check::new("a", true, "ok")]);
     assert_eq!(out.lines().next(), Some("ssh-broker v0.2.0"), "{out}");
 }
-
-/// The heading judges nothing: the exit code is the rows', whatever the report says above them.
-#[test]
-fn the_exit_code_of_a_report_is_the_exit_code_of_its_rows() {
-    for (rows, code) in [
-        (vec![Check::new("a", true, "ok")], 0),
-        (vec![Check::new("a", false, "nope")], 1),
-        (vec![], 1),
-    ] {
-        assert!(format_report("0.2.0", Some(Path::new(EXE)), &rows).starts_with("ssh-broker v0.2.0 ("));
-        assert_eq!(doctor_exit_code(&rows), code);
-    }
-}

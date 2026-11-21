@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use super::handover::Stream;
+use super::handover::{Say, Stream};
 use super::report::Check;
 use crate::acl;
 
@@ -112,7 +112,7 @@ pub fn install_dir_row(base: &BaseCheck<'_>) -> Check {
 pub fn prepare_in(
     base: &TrustedBase<'_>,
     current_exe: &Path,
-    say: &mut dyn FnMut(Stream, &str),
+    say: &mut Say<'_>,
     stop_agents: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<PathBuf> {
     if would_replace_installed_exe(base.layout, current_exe) {

@@ -1,6 +1,6 @@
 use super::*;
 use crate::acl;
-use crate::test_support::{FILE_READ_EXECUTE, aces};
+use crate::test_support::{FILE_READ_EXECUTE, Said, aces, recording, silent};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A not-yet-created base directory under the temp dir that is removed on drop.
@@ -39,23 +39,14 @@ fn prepare(
     stop_agents: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<PathBuf> {
     let base = ensure_base(layout)?;
-    prepare_in(&base, current_exe, &mut quiet, stop_agents)
+    prepare_in(&base, current_exe, &mut silent, stop_agents)
 }
 
-/// A sink for the tests that do not look at what is said.
-fn quiet(_: Stream, _: &str) {}
-
 /// What `prepare_in` says over `layout`, `source` and a stop that does nothing.
-fn said_by_prepare_in(layout: &Layout, source: &Path) -> Vec<(Stream, String)> {
-    let mut said = Vec::new();
-    prepare_in(
-        &forged(layout),
-        source,
-        &mut |stream, text| said.push((stream, text.to_owned())),
-        || Ok(()),
-    )
-    .unwrap();
-    said
+fn said_by_prepare_in(layout: &Layout, source: &Path) -> Said {
+    let said = std::cell::RefCell::new(Vec::new());
+    prepare_in(&forged(layout), source, &mut recording(&said), || Ok(())).unwrap();
+    said.into_inner()
 }
 
 impl Drop for TempBase {
@@ -175,7 +166,7 @@ fn prepare_in_stops_the_agents_before_it_replaces_a_changed_exe() {
     let layout = base.layout();
     let seen = std::cell::RefCell::new(None);
 
-    let exe = prepare_in(&forged(&layout), &source, &mut quiet, || {
+    let exe = prepare_in(&forged(&layout), &source, &mut silent, || {
         *seen.borrow_mut() = Some(std::fs::read_to_string(layout.canonical_exe()).unwrap());
         Ok(())
     })
@@ -197,7 +188,7 @@ fn prepare_in_does_not_stop_agents_when_the_exe_is_unchanged() {
     let source = new_exe(&base, "same build");
     let layout = base.layout();
 
-    prepare_in(&forged(&layout), &source, &mut quiet, || {
+    prepare_in(&forged(&layout), &source, &mut silent, || {
         panic!("the exe is not replaced, so no agent needs to leave")
     })
     .unwrap();
@@ -211,15 +202,10 @@ fn prepare_in_says_the_agents_are_stopped_before_it_stops_them_and_only_when_it_
     let layout = base.layout();
     let said = std::cell::RefCell::new(Vec::new());
 
-    prepare_in(
-        &forged(&layout),
-        &source,
-        &mut |stream, text| said.borrow_mut().push((stream, text.to_owned())),
-        || {
-            assert_eq!(said.borrow().len(), 1, "the line comes before the stop");
-            Ok(())
-        },
-    )
+    prepare_in(&forged(&layout), &source, &mut recording(&said), || {
+        assert_eq!(said.borrow().len(), 1, "the line comes before the stop");
+        Ok(())
+    })
     .unwrap();
 
     let said = said.into_inner();
@@ -255,7 +241,10 @@ fn prepare_in_changes_nothing_when_agents_cannot_be_stopped_for_an_update() {
 
     let err = format!(
         "{:#}",
-        prepare_in(&forged(&layout), &source, &mut quiet, || anyhow::bail!("access denied")).unwrap_err()
+        prepare_in(&forged(&layout), &source, &mut silent, || anyhow::bail!(
+            "access denied"
+        ))
+        .unwrap_err()
     );
 
     assert!(err.contains("access denied"), "{err}");
@@ -280,7 +269,7 @@ fn prepare_in_fails_when_the_exe_is_still_in_use_after_the_stop() {
 
     let err = format!(
         "{:#}",
-        prepare_in(&forged(&layout), &source, &mut quiet, || Ok(())).unwrap_err()
+        prepare_in(&forged(&layout), &source, &mut silent, || Ok(())).unwrap_err()
     );
 
     assert!(err.contains("in use"), "{err}");
@@ -342,7 +331,7 @@ fn prepare_in_reports_a_failed_copy_by_its_cause() {
 
     let err = format!(
         "{:#}",
-        prepare_in(&forged(&layout), &source, &mut quiet, || Ok(())).unwrap_err()
+        prepare_in(&forged(&layout), &source, &mut silent, || Ok(())).unwrap_err()
     );
 
     assert!(err.contains("ssh-broker.exe"), "{err}");
@@ -356,7 +345,7 @@ fn prepare_in_does_not_stop_agents_when_no_exe_is_installed() {
     let source = new_exe(&base, "new build");
     let layout = base.layout();
 
-    prepare_in(&forged(&layout), &source, &mut quiet, || {
+    prepare_in(&forged(&layout), &source, &mut silent, || {
         panic!("there is no installed exe, so no agent holds it")
     })
     .unwrap();

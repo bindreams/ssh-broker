@@ -173,7 +173,9 @@ mod provision_tests;
 
 #[cfg(windows)]
 mod imp {
-    use super::handover::{Handover, Stream, hand_over, remove_arguments, replace_shell, say_to_console};
+    use super::handover::{
+        Handover, Say, Stream, hand_over, remove_arguments, replace_shell, say_to_console, show_to_console,
+    };
     use super::layout::{self, Layout};
     use super::registry::SshdShell;
     use super::{
@@ -263,7 +265,7 @@ mod imp {
                             eq_path(&shell, &exe) && opt == "-c",
                             "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
                         );
-                        remove_shell_arguments(&base.layout().system_config_path(), say);
+                        remove_shell_arguments(&base.layout().system_config_path(), say)?;
 
                         // 4. The install directory on the system PATH, before any agent starts: an agent's
                         //    environment is fixed when it starts, and its sessions inherit it.
@@ -295,7 +297,7 @@ mod imp {
 
     /// Append the install directory to the machine's `PATH`, so that a session finds `ssh-broker` by name.
     /// The value keeps its registry type; see [`flow::add_install_dir_to_path`].
-    fn add_install_dir_to_path(say: &mut flow::Say<'_>) {
+    fn add_install_dir_to_path(say: &mut Say<'_>) {
         flow::add_install_dir_to_path(
             say,
             super::BASE_DIR,
@@ -314,41 +316,48 @@ mod imp {
     /// config yet (see [`system_config`]). Must run before the registry is overwritten. The install is
     /// complete without the config, so a failure is said on stderr and `install` goes on; the
     /// [`Handover`] it returns is what the flip takes. `previous` is what the registry holds now.
-    fn carry_previous_shell(base: &layout::TrustedBase<'_>, previous: &SshdShell, say: &mut flow::Say<'_>) -> Handover {
-        // The two lookups below say what they cannot find out while `hand_over` waits to say its own lines, and the
-        // lookups are `Fn`s: the sink is shared through a cell.
-        let say = std::cell::RefCell::new(say);
+    fn carry_previous_shell(
+        base: &layout::TrustedBase<'_>,
+        previous: &SshdShell,
+        say: &mut Say<'_>,
+    ) -> anyhow::Result<Handover> {
         let config = base.layout().system_config_path();
         let config_is_file = system_config::config_is_file(&config);
         let host = crate::shell::WindowsHost;
-        // The file the shell resolves to, found as sshd finds it (a bare name is searched in sshd's own
-        // directory, the system and Windows directories, then on `PATH`), so the identity check below
-        // looks at that file and not at one of that name beside `install`. Looked up only when the
-        // decision needs it, so that what cannot be read is not reported when it does not matter.
-        let search = || {
-            let image = registry::read_sshd_image_path().unwrap_or_else(|e| {
-                (say.borrow_mut())(Stream::Err, &system_config::sshd_location_unreadable(&format!("{e:#}")));
-                None
-            });
-            system_config::sshd_search_dirs(&host, image.as_deref())
-                .map_err(|e| format!("cannot find the system directory to look for the shell in: {e:#}"))
+        // The decision is made first, and the lookups it runs say what they cannot find out as they run. `decide`
+        // takes them as `Fn`s, so the sink is shared through a cell, which ends with the block: nothing after the
+        // decision holds the sink.
+        let decision = {
+            let say = std::cell::RefCell::new(&mut *say);
+            // The file the shell resolves to, found as sshd finds it (a bare name is searched in sshd's own
+            // directory, the system and Windows directories, then on `PATH`), so the identity check below
+            // looks at that file and not at one of that name beside `install`. Looked up only when the
+            // decision needs it, so that what cannot be read is not reported when it does not matter.
+            let search = || {
+                let image = registry::read_sshd_image_path().unwrap_or_else(|e| {
+                    (say.borrow_mut())(Stream::Err, &system_config::sshd_location_unreadable(&format!("{e:#}")));
+                    None
+                });
+                system_config::sshd_search_dirs(&host, image.as_deref())
+                    .map_err(|e| format!("cannot find the system directory to look for the shell in: {e:#}"))
+            };
+            let find =
+                |dirs: &[PathBuf], path: &Path| crate::shell::resolve_program_in(&host, dirs, &path.to_string_lossy());
+            let is_system_cmd = |found: &Path| {
+                use crate::shell::Host;
+                host.is_system_cmd(found).unwrap_or_else(|e| {
+                    (say.borrow_mut())(Stream::Err, &system_config::system_cmd_unknown(found, &e.to_string()));
+                    false
+                })
+            };
+            system_config::decide(previous, config_is_file, &search, &find, &is_system_cmd)
         };
-        let find =
-            |dirs: &[PathBuf], path: &Path| crate::shell::resolve_program_in(&host, dirs, &path.to_string_lossy());
-        let is_system_cmd = |found: &Path| {
-            use crate::shell::Host;
-            host.is_system_cmd(found).unwrap_or_else(|e| {
-                (say.borrow_mut())(Stream::Err, &system_config::system_cmd_unknown(found, &e.to_string()));
-                false
-            })
-        };
-        let decision = system_config::decide(previous, config_is_file, &search, &find, &is_system_cmd);
         hand_over(
             &config,
             previous,
             decision,
             |block| system_config::create_once(base, block),
-            &mut **say.borrow_mut(),
+            &mut show_to_console,
         )
     }
 
@@ -357,8 +366,9 @@ mod imp {
     /// `install` that replaced the shell) or are not wanted. A value that cannot be read, or with no file known
     /// to hold it, is the only copy of the old setup: it is left, and said, for the next `install` (see
     /// [`system_config::plan_arguments`]). A removal prints the value before it deletes it
-    /// ([`remove_arguments`]), and a failed one says so with the cause and `install` goes on.
-    fn remove_shell_arguments(config: &Path, say: &mut flow::Say<'_>) {
+    /// ([`remove_arguments`]), and a failed one says so with the cause and `install` goes on. A value that could not
+    /// be shown is not removed, and that is an error of the step.
+    fn remove_shell_arguments(config: &Path, say: &mut Say<'_>) -> anyhow::Result<()> {
         let key = registry::OPENSSH_KEY;
         // Read on its own: another value that cannot be read does not make this one unreadable.
         let read = registry::read_shell_arguments_under(key).map_err(|e| format!("{e:#}"));
@@ -369,7 +379,8 @@ mod imp {
             || system_config::config_is_file(config),
             |shown| registry::remove_shell_arguments_under(key, shown),
             say,
-        );
+            &mut show_to_console,
+        )
     }
 
     /// The background sessions' part of the stop that precedes replacing the exe: the auto-login
@@ -403,7 +414,7 @@ mod imp {
     /// Enable every auto-login task that is disabled and start each one that has no session: undoes
     /// the stop's disabling, and repairs what an `install` that was killed (or a task disabled by hand)
     /// left. See [`flow::repair_sessions`].
-    fn repair_session_tasks(say: &mut flow::Say<'_>) -> anyhow::Result<()> {
+    fn repair_session_tasks(say: &mut Say<'_>) -> anyhow::Result<()> {
         flow::repair_sessions(
             say,
             taskscheduler::session_tasks,
@@ -414,7 +425,7 @@ mod imp {
     }
 
     /// Step 4 of `install`: see [`flow::start_agents`].
-    fn start_agents(survivors: &[procwait::Survivor], say: &mut flow::Say<'_>) {
+    fn start_agents(survivors: &[procwait::Survivor], say: &mut Say<'_>) {
         flow::start_agents(
             say,
             sessions::interactive_sessions,
