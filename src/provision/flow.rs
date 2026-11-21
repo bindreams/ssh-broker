@@ -1,20 +1,20 @@
-//! The shape of `apply`: install, then bring agents back. Held apart from the Windows calls so
+//! The shape of `install`: set up, then bring agents back. Held apart from the Windows calls so
 //! the failure paths can be tested with stand-ins.
 
 use anyhow::Context;
 
 use super::procwait::{self, StillRunning, Survivor};
-use super::schtasks::{APPLY_SSHD_TASK, WaitOutcome, end_and_remove_apply_sshd_task};
+use super::schtasks::{INSTALL_SSHD_TASK, WaitOutcome, end_and_remove_install_sshd_task};
 use super::sshd_config::CHECK_SSHD;
 
-/// The wait, at the start of `apply` and right after its lock, for the sshd step of an earlier `apply`.
+/// The wait, at the start of `install` and right after its lock, for the sshd step of an earlier `install`.
 ///
-/// The lock makes one `apply` run at a time for its whole run, and an earlier `apply` that was ended after its
+/// The lock makes one `install` run at a time for its whole run, and an earlier `install` that was ended after its
 /// hand-over has the sshd step as the rest of that run: its task's instance outlives its process, running the
 /// installed exe, and ending it between its stop of sshd and its start would leave sshd stopped. So it is waited
 /// for, with no bound once it has launched, before this run stops, replaces or reads anything it works on.
 /// `wait` is given the function that says the wait has begun, and calls it when it finds an earlier step; it
-/// returns when the instances have ended. An instance the Task Scheduler never launched stops `apply`, as a
+/// returns when the instances have ended. An instance the Task Scheduler never launched stops `install`, as a
 /// task that never clears does in `stop_instances`: nothing goes on beside an instance that may still start.
 pub fn wait_for_earlier_sshd_step(
     say: &mut dyn FnMut(&str),
@@ -22,53 +22,53 @@ pub fn wait_for_earlier_sshd_step(
 ) -> anyhow::Result<()> {
     let outcome = wait(&mut || {
         say(&format!(
-            "apply: an earlier apply's sshd step is still running (the task {APPLY_SSHD_TASK}); waiting for it to \
+            "install: an earlier install's sshd step is still running (the task {INSTALL_SSHD_TASK}); waiting for it to \
              finish"
         ))
     })
-    .context("wait for an earlier apply's sshd step")?;
+    .context("wait for an earlier install's sshd step")?;
     match outcome {
         WaitOutcome::Ended => Ok(()),
         WaitOutcome::NeverLaunched { count } => anyhow::bail!(
-            "the Task Scheduler lists {count} instance(s) of the task {APPLY_SSHD_TASK} that it has not started \
-             after {} s, so apply went no further. End and remove the task {}; if the step has started meanwhile, \
-             ending it can leave sshd stopped. {CHECK_SSHD} Then run apply again",
+            "the Task Scheduler lists {count} instance(s) of the task {INSTALL_SSHD_TASK} that it has not started \
+             after {} s, so install went no further. End and remove the task {}; if the step has started meanwhile, \
+             ending it can leave sshd stopped. {CHECK_SSHD} Then run install again",
             procwait::EXIT_BOUND.as_secs(),
-            end_and_remove_apply_sshd_task()
+            end_and_remove_install_sshd_task()
         ),
     }
 }
 
-/// Run `install`, then `start` the agents.
+/// Run `set_up`, then `start` the agents.
 ///
-/// `install` receives the function that stops every agent and must call it at most once, before
-/// it replaces the exe. If `install` fails after that call (or inside it, since a stop that
+/// `set_up` receives the function that stops every agent and must call it at most once, before
+/// it replaces the exe. If `set_up` fails after that call (or inside it, since a stop that
 /// failed part-way has still stopped some agents), `start` still runs, best-effort, so a failed
-/// `apply` does not leave every logged-on user without an agent.
+/// `install` does not leave every logged-on user without an agent.
 ///
 /// `resume_agent_task` enables the agent task and runs on every call, whatever came before: a stop
-/// disables the task, and an earlier `apply` that was killed before it got here may have left it
+/// disables the task, and an earlier `install` that was killed before it got here may have left it
 /// so. `repair_sessions` does the same for the auto-login tasks and starts the ones with no
-/// session (see [`repair_sessions`]); it too runs on every call, including a failed install and an
-/// install that stopped nothing, and does not depend on the agent task. If
+/// session (see [`repair_sessions`]); it too runs on every call, including a failed `set_up` and a
+/// `set_up` that stopped nothing, and does not depend on the agent task. If
 /// the agent task cannot be enabled, no agent is started (a disabled task starts nothing); a
 /// failure of `repair_sessions` does not hold the start back. Either failure is the result unless
-/// `install` had already failed, in which case that error is returned as it was and the other is
+/// `set_up` had already failed, in which case that error is returned as it was and the other is
 /// printed.
 ///
-/// If the stop left agents running (see [`StillRunning`], found under any context `install`
+/// If the stop left agents running (see [`StillRunning`], found under any context `set_up`
 /// added), `start` is told which: an agent started in the session of a survivor would find that
 /// session's slot taken and exit, leaving the session with none once the survivor dies.
 pub fn run<T>(
     stop: impl FnOnce() -> anyhow::Result<()>,
-    install: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<T>,
+    set_up: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<T>,
     resume_agent_task: impl FnOnce() -> anyhow::Result<()>,
     repair_sessions: impl FnOnce() -> anyhow::Result<()>,
     start: impl FnOnce(&[Survivor]),
 ) -> anyhow::Result<T> {
     let mut stop = Some(stop);
     let mut attempted = false;
-    let result = install(&mut || {
+    let result = set_up(&mut || {
         attempted = true;
         stop.take().expect("the stop is called at most once")()
     });
@@ -81,7 +81,7 @@ pub fn run<T>(
         (Ok(()), Err(e)) => (true, Some(e)),
         (Err(e), Ok(())) => (false, Some(e)),
         (Err(e), Err(sessions)) => {
-            eprintln!("apply: {sessions:#}");
+            eprintln!("install: {sessions:#}");
             (false, Some(e))
         }
     };
@@ -95,14 +95,14 @@ pub fn run<T>(
     match (result, failure) {
         (result, None) => result,
         (Ok(_), Some(e)) => Err(e),
-        (Err(install_error), Some(e)) => {
-            eprintln!("apply: {e:#}");
-            Err(install_error)
+        (Err(set_up_error), Some(e)) => {
+            eprintln!("install: {e:#}");
+            Err(set_up_error)
         }
     }
 }
 
-/// A per-user auto-login task, as `apply` finds it.
+/// A per-user auto-login task, as `install` finds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionTask {
     pub name: String,
@@ -117,7 +117,7 @@ pub struct SessionTask {
 /// All the tasks are disabled before any is stopped, so that none restarts its session (a task
 /// restarts itself when its process fails) while another is being stopped. They stay disabled for
 /// the caller to copy the exe; [`repair_sessions`] enables them again, and a run that is killed
-/// before that leaves them for the next `apply` to repair. The agents are looked for again after
+/// before that leaves them for the next `install` to repair. The agents are looked for again after
 /// each round until none is left: a condition re-checked, not an attempt count; a process that
 /// outlives the bound fails the stop through `wait`, naming its pid.
 ///
@@ -151,7 +151,7 @@ pub fn stop_sessions<P>(
     }
 }
 
-/// Bring the auto-login tasks to a working state, whatever an earlier `apply` left: every task that
+/// Bring the auto-login tasks to a working state, whatever an earlier `install` left: every task that
 /// is disabled is enabled, and every task that is enabled and has no running instance is started,
 /// so the users who had auto-login have their session again. A session that is running is not
 /// touched.
@@ -175,7 +175,7 @@ pub fn repair_sessions(
             if first.is_none() {
                 first = Some(e);
             } else {
-                eprintln!("apply: {e:#}");
+                eprintln!("install: {e:#}");
             }
             continue;
         }
@@ -183,11 +183,11 @@ pub fn repair_sessions(
             Ok(true) => {}
             Ok(false) => {
                 if let Err(e) = run(&name) {
-                    eprintln!("apply: could not start the {name} task: {e:#}");
+                    eprintln!("install: could not start the {name} task: {e:#}");
                 }
             }
             Err(e) => {
-                eprintln!("apply: could not tell whether the {name} task is running, so it was not started: {e:#}")
+                eprintln!("install: could not tell whether the {name} task is running, so it was not started: {e:#}")
             }
         }
     }

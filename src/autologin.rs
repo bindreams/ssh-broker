@@ -31,12 +31,12 @@ pub enum BatchRight {
     Refused(String),
 }
 
-/// What the install directory, which holds the apply lock, is.
+/// What the install directory, which holds the install lock, is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallDir {
-    /// There is none: no `apply` has run, or it was removed.
+    /// There is none: no `install` has run, or it was removed.
     Missing,
-    /// It exists and fails its check, in its words; `apply` refuses it too.
+    /// It exists and fails its check, in its words; `install` refuses it too.
     Untrusted(String),
     Trusted,
 }
@@ -46,11 +46,11 @@ pub trait AutoLoginEnv {
     fn is_elevated(&self) -> anyhow::Result<bool>;
     /// Whether there is a terminal to ask for the password on.
     fn has_terminal(&self) -> bool;
-    /// Take the lock that keeps `apply` and these commands from running at once, waiting for
+    /// Take the lock that keeps `install` and these commands from running at once, waiting for
     /// whoever holds it (no limit: it returns only once taken). An `Err` is therefore a failure to
     /// take it, never a wait that ran out. The lock is held until the returned value is dropped. Needs
     /// the elevation that the callers have already proved: the lock file is private to administrators.
-    fn lock_apply(&mut self) -> anyhow::Result<Box<dyn std::any::Any>>;
+    fn lock_install(&mut self) -> anyhow::Result<Box<dyn std::any::Any>>;
     /// What the install directory is, without creating or changing anything.
     fn install_dir(&self) -> InstallDir;
     /// The installed exe, which the task runs and the messages name.
@@ -116,13 +116,13 @@ pub fn on(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result<
     // Read-only and before the prompt: with no install there is nothing to register the task for, and
     // the password would be typed for nothing. Checked again under the lock, as it may change meanwhile.
     env.check_install()?;
-    // Not under the lock: a prompt left open must not hold up `apply`.
+    // Not under the lock: a prompt left open must not hold up `install`.
     let password = env
         .ask_password(account)?
         .ok_or_else(|| anyhow::anyhow!("ssh-broker: cancelled; nothing was changed."))?;
-    // Held to the end: an `apply` in the middle of this would stop or start a session that this is
+    // Held to the end: an `install` in the middle of this would stop or start a session that this is
     // changing, and one that replaces the exe could do it between the check of it and the task's run.
-    let _apply = env.lock_apply()?;
+    let _install = env.lock_install()?;
     env.check_install()?;
     match env.batch_right(account, &password) {
         BatchRight::Granted => {}
@@ -183,20 +183,20 @@ pub fn off(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result
     );
     // The task holds a stored password, so `off` must be able to delete it where the lock cannot be
     // had: without an install directory there is nothing to lock, one that fails its check is refused
-    // by `apply` as well, and a lock that fails to be taken (not one that is held: that waits, and
+    // by `install` as well, and a lock that fails to be taken (not one that is held: that waits, and
     // returns only once taken) would otherwise leave the task and its password in place.
-    let _apply = match env.install_dir() {
+    let _install = match env.install_dir() {
         InstallDir::Missing => None,
         InstallDir::Untrusted(reason) => {
             env.say(&no_lock_warning(&format!(
-                "the apply lock was not taken: the install directory is not trusted ({reason})"
+                "the install lock was not taken: the install directory is not trusted ({reason})"
             )));
             None
         }
-        InstallDir::Trusted => match env.lock_apply() {
+        InstallDir::Trusted => match env.lock_install() {
             Ok(lock) => Some(lock),
             Err(e) => {
-                // The error already says the lock could not be taken, in the words of `lock_apply`.
+                // The error already says the lock could not be taken, in the words of `lock_install`.
                 let cause = format!("{e:#}");
                 env.say(&no_lock_warning(cause.strip_prefix("ssh-broker: ").unwrap_or(&cause)));
                 None
@@ -227,9 +227,9 @@ pub enum PasswordSource {
 /// The real machine: Task Scheduler, the console, LSA.
 pub struct WindowsEnv {
     source: PasswordSource,
-    /// The install directory, which holds the apply lock and the exe the task runs.
+    /// The install directory, which holds the install lock and the exe the task runs.
     layout: Layout,
-    /// Runs once when the apply lock is found held, before the wait for it begins.
+    /// Runs once when the install lock is found held, before the wait for it begins.
     on_lock_wait: Box<dyn FnMut()>,
     /// The exe the task runs, when it is not the installed one (tests); the install is then not checked.
     exe_override: Option<PathBuf>,
@@ -238,11 +238,11 @@ pub struct WindowsEnv {
 impl WindowsEnv {
     pub fn new(source: PasswordSource) -> WindowsEnv {
         WindowsEnv::with_layout(source, Layout::production(), || {
-            eprintln!("ssh-broker: an apply or auto-login command is running; waiting for it to finish")
+            eprintln!("ssh-broker: an install or auto-login command is running; waiting for it to finish")
         })
     }
 
-    /// An env over the install directory of `layout`; `on_lock_wait` runs when the apply lock is held
+    /// An env over the install directory of `layout`; `on_lock_wait` runs when the install lock is held
     /// by another and the wait for it is about to begin.
     pub(crate) fn with_layout(
         source: PasswordSource,
@@ -299,15 +299,15 @@ impl AutoLoginEnv for WindowsEnv {
         install_dir_of(&self.layout)
     }
 
-    fn lock_apply(&mut self) -> anyhow::Result<Box<dyn std::any::Any>> {
+    fn lock_install(&mut self) -> anyhow::Result<Box<dyn std::any::Any>> {
         if self.exe_override.is_some() {
             return Ok(Box::new(()));
         }
         crate::provision::layout::ensure_base(&self.layout)
-            .context("ssh-broker: could not prepare the install directory that holds the apply lock")?;
+            .context("ssh-broker: could not prepare the install directory that holds the install lock")?;
         let on_wait = &mut self.on_lock_wait;
-        let lock = crate::provision::apply_lock::acquire(&self.layout.apply_lock_path(), on_wait)
-            .context("ssh-broker: could not take the apply lock")?;
+        let lock = crate::provision::install_lock::acquire(&self.layout.install_lock_path(), on_wait)
+            .context("ssh-broker: could not take the install lock")?;
         Ok(Box::new(lock))
     }
 
@@ -320,13 +320,13 @@ impl AutoLoginEnv for WindowsEnv {
             InstallDir::Missing => {}
             InstallDir::Untrusted(reason) => anyhow::bail!(
                 "ssh-broker: the install directory is not trusted ({reason}); the task would run from it with a \
-                 stored password. Run apply, or inspect the directory"
+                 stored password. Run install, or inspect the directory"
             ),
             InstallDir::Trusted if layout.canonical_exe().is_file() => return Ok(()),
             InstallDir::Trusted => {}
         }
         anyhow::bail!(
-            "ssh-broker: {} is not installed; run apply first",
+            "ssh-broker: {} is not installed; run install first",
             layout.canonical_exe().display()
         )
     }

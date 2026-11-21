@@ -12,7 +12,7 @@ use crate::socket_loc::{Elevation, Integrity};
 use super::probe::{ProbeResult, SymlinkState, is_genuine_session};
 use super::report::Check;
 
-const APPLY_HINT: &str = "usually an installed exe older than this check: re-run `apply`";
+const INSTALL_HINT: &str = "usually an installed exe older than this check: re-run `install`";
 
 /// The name of the row about the session a login that asks for `always` gets.
 const ELEVATED_ROW: &str = "elevated session on request";
@@ -214,7 +214,7 @@ pub fn session_rows(session: &Answer, elevated: Option<&ProbeOutcome>) -> Vec<Ch
 /// any, and otherwise the likeliest reason.
 fn not_reported(what: &str, token_said: &str) -> String {
     if token_said.is_empty() {
-        format!("the probe did not report {what} ({APPLY_HINT})")
+        format!("the probe did not report {what} ({INSTALL_HINT})")
     } else {
         format!("the probe did not report {what}: {token_said}")
     }
@@ -345,7 +345,7 @@ pub fn link_row(junction: &Junction) -> Check {
             return Check::new(
                 NAME,
                 false,
-                with_note(&format!("the probe did not report its junction ({APPLY_HINT})"), note),
+                with_note(&format!("the probe did not report its junction ({INSTALL_HINT})"), note),
             );
         }
         Junction::Unavailable { cause, note } => {

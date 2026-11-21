@@ -1,25 +1,25 @@
-//! provision::registry — the `HKLM\SOFTWARE\OpenSSH` values `apply` owns (pure list + Windows Reg*).
+//! provision::registry — the `HKLM\SOFTWARE\OpenSSH` values `install` owns (pure list + Windows Reg*).
 //!
 //! Uses windows-rs `Reg*` directly (not the `winreg` crate) — `windows` is already a
 //! dependency and this matches the hand-rolled-FFI + RAII idiom of `acl.rs`/`winutil.rs`.
-//! The production target is `HKLM\SOFTWARE\OpenSSH` (which needs elevation to write — `apply`
+//! The production target is `HKLM\SOFTWARE\OpenSSH` (which needs elevation to write — `install`
 //! is an admin operation); the FFI core is root-parameterized so the unit test can exercise
 //! the same code path under HKCU without elevation.
 
 use super::report::Check;
 
-/// A registry value `apply` writes.
+/// A registry value `install` writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegValue {
     Sz(String),
     Dword(u32),
 }
 
-/// The three `HKLM\SOFTWARE\OpenSSH` values `apply` owns, in FAIL-SAFE write order.
+/// The three `HKLM\SOFTWARE\OpenSSH` values `install` owns, in FAIL-SAFE write order.
 ///
 /// sshd reads `DefaultShell`, `DefaultShellCommandOption`, `DefaultShellArguments` and
 /// `DefaultShellEscapeArguments` once per session (`pwd.c` `set_defaultshell`), so the shim cannot
-/// ask later which form sshd used; `apply` sets the form instead. There is no atomicity across the
+/// ask later which form sshd used; `install` sets the form instead. There is no atomicity across the
 /// writes, so each crash point must be harmless:
 ///
 /// - the escape flag FIRST: sshd escapes the command for every shell the flag does not exempt, so
@@ -48,18 +48,18 @@ pub fn escape_arguments_check<E: std::fmt::Display>(read: Result<bool, E>) -> Ch
         Ok(false) => Check::new(
             name,
             false,
-            "sshd would not escape the command, which the shim cannot decode; run `ssh-broker apply`",
+            "sshd would not escape the command, which the shim cannot decode; run `ssh-broker install`",
         ),
         Err(error) => Check::new(
             name,
             false,
-            format!("cannot read it ({error}); run `ssh-broker apply` and check the key's permissions"),
+            format!("cannot read it ({error}); run `ssh-broker install` and check the key's permissions"),
         ),
     }
 }
 
 /// What sshd reads to start a session's shell (`pwd.c` `set_defaultshell`): the four
-/// `HKLM\SOFTWARE\OpenSSH` values `apply` carries into the system config before it overwrites them.
+/// `HKLM\SOFTWARE\OpenSSH` values `install` carries into the system config before it overwrites them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshdShell {
     /// `DefaultShell`; `None` when absent, empty or too long for sshd's buffer ([`SSHD_VALUE_BYTES`]).
@@ -97,7 +97,7 @@ pub struct SshdShellReading {
 
 impl SshdShellReading {
     /// The shell sshd uses, when every value that matters was read. With no `DefaultShell` sshd
-    /// ignores the other three, so their failures do not matter. With ssh-broker's own, `apply` replaces
+    /// ignores the other three, so their failures do not matter. With ssh-broker's own, `install` replaces
     /// it with itself and loses nothing, so a value that could not be read is taken as not set (escaping
     /// on). `location` names the key for the error.
     pub fn into_shell(self, location: &str) -> Result<SshdShell, UnreadShell> {
@@ -154,7 +154,7 @@ impl SshdShellReading {
 }
 
 /// The shell sshd uses now could not be read in full. Replacing it would lose what could not be read,
-/// so `apply` stops before it does. `apply` prints this text before it writes the registry and adds that
+/// so `install` stops before it does. `install` prints this text before it writes the registry and adds that
 /// `DefaultShell` was not changed; the text itself says nothing about what was changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadShell {
@@ -513,7 +513,7 @@ mod win {
     /// Tell the windows of the machine that the environment changed, as the System dialog does. The
     /// programs that read it (Explorer, and what it starts) then take the new `Path`; a process that is
     /// already running keeps its own. A window that is hung is given up on; nothing depends on one having
-    /// answered. Run over SSH, `apply` has no desktop and the message reaches no window of that session;
+    /// answered. Run over SSH, `install` has no desktop and the message reaches no window of that session;
     /// sessions that sshd and the agent start read the registry themselves.
     pub fn broadcast_environment_change() {
         use windows::Win32::Foundation::{LPARAM, WPARAM};

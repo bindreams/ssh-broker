@@ -8,7 +8,7 @@ invariants: [CONTRIBUTING.md](CONTRIBUTING.md). This file is the short orientati
 One binary with a handful of entry points plus the hidden `doctor-probe` and `console-fallback` children, dispatched by argv. The **shim** is sshd's `DefaultShell`
 and is the default action; the **agent** runs in a user's interactive session (one per logged-on
 user) and hosts the shell in a pseudoconsole (PTY) or on redirected pipes (`ssh host cmd`); the two
-speak framed messages over an ACL-gated AF_UNIX socket in that user's profile. `apply` and
+speak framed messages over an ACL-gated AF_UNIX socket in that user's profile. `install` and
 `doctor` install and check that arrangement.
 
 The point is lineage: a shell that is a child of the agent rather than of `sshd` inherits
@@ -45,9 +45,9 @@ Levels and `ssh-broker elevate` are described in README.md#elevated-sessions; `a
 | `filelog` | the daily log in the user's own folder, written under the folder's handle |
 | `handoff` | the notice and the line the agent writes into the inherited pipe it hands the hidden `console-fallback` verb |
 | `vtinput` | Win32 `INPUT_RECORD` → VT sequences, and what a key means to a line being typed (`KeyEvent::line_key`, which both console prompts read through; pure, host-testable) |
-| `provision`, `provision/{probe,probe_run,session_rows}` | `apply`/`doctor`: DefaultShell, logon task, per-user socket rows, parity probes (the PROBE line, the junction they follow, the two probes of an agent at High: `prompt`, the default level, then `always`) and the rows they give (`Probes::session` gives the session id, DPAPI, byte and `session` rows; `Probes::elevated` the `elevated session on request` row) |
+| `provision`, `provision/{probe,probe_run,session_rows}` | `install`/`doctor`: DefaultShell, logon task, per-user socket rows, parity probes (the PROBE line, the junction they follow, the two probes of an agent at High: `prompt`, the default level, then `always`) and the rows they give (`Probes::session` gives the session id, DPAPI, byte and `session` rows; `Probes::elevated` the `elevated session on request` row) |
 | `provision/sshd_config` (+`configure`, `restart`, `machine`) | making sshd accept `SSH_BROKER_ELEVATION`: the drop-in and the `Include` (or the `AcceptEnv` line) as a text edit checked by `sshd -t`, the restart of the service through the service manager, and `doctor`'s `sshd accepts` row |
-| `provision/sshd_task`, `provision/procwait` | `apply`'s sshd step run by the transient SYSTEM task `ssh-broker-apply-sshd` (hidden verb `apply-sshd`), so that it finishes if `apply` is ended; and the processes `apply` waits for, found by exe and told by `Role` (shim, desktop agent, background agent, `apply-sshd`) |
+| `provision/sshd_task`, `provision/procwait` | `install`'s sshd step run by the transient SYSTEM task `ssh-broker-install-sshd` (hidden verb `install-sshd`), so that it finishes if `install` is ended; and the processes `install` waits for, found by exe and told by `Role` (shim, desktop agent, background agent, `install-sshd`) |
 | `provision/path_env` | the install directory on the system `PATH`, and its `doctor` row |
 | `offer`, `offer/text` | the session offer as a pure state machine over injected I/O, and every line it shows |
 | `secret`, `password_entry` | wiped password buffers, and the key-event state machine that fills one |

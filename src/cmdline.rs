@@ -77,7 +77,7 @@ pub enum Encoding {
     /// sshd escapes it when `DefaultShellEscapeArguments` is nonzero or absent and the
     /// `DefaultShell` path is not one it special-cases (`w32-doexec.c:308-318`, `:370-371`). It
     /// reads both once per session (`pwd.c` `set_defaultshell`), so a re-read here could disagree
-    /// with the session being served. ssh-broker owns the setting instead: `apply` writes the flag
+    /// with the session being served. ssh-broker owns the setting instead: `install` writes the flag
     /// and installs the shim at a path sshd does not special-case, and `doctor` checks it.
     Escaped,
 }
@@ -231,7 +231,7 @@ pub fn dash_c_tail(line: &str) -> Option<&str> {
 ///   no space) is not split.
 ///
 /// The third form sshd has (the command wrapped in quotes, unescaped) is for
-/// `DefaultShellEscapeArguments=0`, which `apply` overwrites; it is not decoded.
+/// `DefaultShellEscapeArguments=0`, which `install` overwrites; it is not decoded.
 ///
 /// An empty tail is an empty command: `-c` was given, so the client asked to run something.
 ///

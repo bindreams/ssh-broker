@@ -146,7 +146,7 @@ fn a_create_refused_for_rights_says_to_elevate() {
     use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER};
     for code in [ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER] {
         let error = windows::core::Error::from(HRESULT::from_win32(code.0));
-        let text = format!("{:#}", create_failure(error, Path::new(r"C:\x\apply.lock")));
+        let text = format!("{:#}", create_failure(error, Path::new(r"C:\x\install.lock")));
         assert!(text.contains("elevated administrator"), "{code:?}: {text}");
     }
 }

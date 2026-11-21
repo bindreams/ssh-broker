@@ -1,6 +1,6 @@
 //! provision::sshd_config — making sshd accept `SSH_BROKER_ELEVATION` from a client.
 //!
-//! `apply` owns a drop-in file, [`DROP_IN_NAME`] in `sshd_config.d`, that holds one `AcceptEnv` line, and
+//! `install` owns a drop-in file, [`DROP_IN_NAME`] in `sshd_config.d`, that holds one `AcceptEnv` line, and
 //! adds one [`INCLUDE_LINE`] to `sshd_config` when sshd does not read the drop-in already. When the folder or
 //! the drop-in cannot be used, it puts the [`ACCEPT_LINE`] itself into `sshd_config`. This module is the pure
 //! part: the text edit, the reader of `sshd -T`, and the `doctor` row. [`configure`] is the flow over a
@@ -40,7 +40,7 @@ pub fn drop_in_text() -> String {
 /// The one line `sshd_config` gets, above its first `Match`, when sshd does not read the drop-in.
 pub const INCLUDE_LINE: &str = "Include sshd_config.d/*.conf";
 
-/// What to do about sshd at this PC when what `apply` said does not settle whether it runs.
+/// What to do about sshd at this PC when what `install` said does not settle whether it runs.
 pub(crate) const CHECK_SSHD: &str =
     "Check sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.";
 
@@ -218,7 +218,7 @@ pub fn pinned(sshd_t_output: &str, name: &str) -> Option<String> {
 }
 
 /// Whether the variable is in force in what `sshd -T` printed: some `acceptenv` pattern takes it, or the
-/// server pins its value itself. The one judgement of `apply` and of the `doctor` row.
+/// server pins its value itself. The one judgement of `install` and of the `doctor` row.
 pub fn in_force(sshd_t_output: &str) -> bool {
     accepts(sshd_t_output, VARIABLE) || pinned(sshd_t_output, VARIABLE).is_some()
 }
@@ -286,7 +286,7 @@ pub fn accepts_row(
             ROW_NAME,
             false,
             format!(
-                "sshd does not accept {VARIABLE} from clients; `ssh-broker apply` sets it up, and says what it \
+                "sshd does not accept {VARIABLE} from clients; `ssh-broker install` sets it up, and says what it \
                  could not do. `ssh-broker elevate` works without it."
             ),
         );
@@ -301,7 +301,7 @@ pub fn accepts_row(
             ROW_NAME,
             false,
             format!(
-                "sshd was started before {} was last changed and has not read it; `ssh-broker apply` restarts it, or \
+                "sshd was started before {} was last changed and has not read it; `ssh-broker install` restarts it, or \
                  restart the sshd service",
                 file.display()
             ),
@@ -311,7 +311,7 @@ pub fn accepts_row(
             true,
             format!(
                 "{in_force_as}; {}'s change time is ahead of the clock, so whether the running sshd has read it \
-                 cannot be told (`ssh-broker apply` restarts it to be sure, or restart the sshd service)",
+                 cannot be told (`ssh-broker install` restarts it to be sure, or restart the sshd service)",
                 file.display()
             ),
         ),
@@ -320,7 +320,7 @@ pub fn accepts_row(
             true,
             format!(
                 "{in_force_as}; {} has `{line}`, so whether the running sshd has read its configuration cannot be \
-                 told (`ssh-broker apply` restarts it to be sure, or restart the sshd service)",
+                 told (`ssh-broker install` restarts it to be sure, or restart the sshd service)",
                 file.display()
             ),
         ),

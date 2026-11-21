@@ -24,7 +24,7 @@
 //! measured: CI has no Windows Terminal).
 //!
 //! **Not `consoleAllocationPolicy=detached`.** It needs build 26100, and this exe is also the shim,
-//! `apply` and `doctor`, which use a console; `FreeConsole` works on every build.
+//! `install` and `doctor`, which use a console; `FreeConsole` works on every build.
 
 use std::num::NonZeroU32;
 

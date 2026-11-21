@@ -1,7 +1,7 @@
-//! provision::sessions — which sessions `apply` starts an agent in.
+//! provision::sessions — which sessions `install` starts an agent in.
 //!
 //! The logon trigger starts an agent at each logon; it does not reach a user who is already
-//! logged on when `apply` runs (the first install, or an upgrade). `apply` starts one in each such
+//! logged on when `install` runs (the first install, or an upgrade). `install` starts one in each such
 //! session, so nobody has to log off and on again.
 
 use anyhow::Context;
@@ -11,7 +11,7 @@ use windows::Win32::System::RemoteDesktop::{
 };
 use windows::core::PWSTR;
 
-/// What `apply` needs to know about one session.
+/// What `install` needs to know about one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
     pub id: u32,
@@ -39,7 +39,7 @@ pub struct Targets {
 }
 
 impl Targets {
-    /// Every session `apply` tried to cover.
+    /// Every session `install` tried to cover.
     pub fn total(&self) -> usize {
         self.ids.len() + self.unknown.len()
     }

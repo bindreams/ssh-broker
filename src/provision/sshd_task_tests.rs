@@ -4,8 +4,8 @@ use super::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-const REPORT: &str = r"C:\ProgramData\ssh-broker\apply-sshd.log";
-const TASK: &str = "ssh-broker-apply-sshd";
+const REPORT: &str = r"C:\ProgramData\ssh-broker\install-sshd.log";
+const TASK: &str = "ssh-broker-install-sshd";
 
 /// What happened, in order: the calls on the task as `task: <call>`, the lines said as `said: <line>`.
 type Log = Rc<RefCell<Vec<String>>>;
@@ -26,7 +26,7 @@ impl Fake {
             register: Ok(()),
             run: Ok(()),
             wait: Ok(WaitOutcome::Ended),
-            report: Ok(complete("apply: sshd restarted; it accepts SSH_BROKER_ELEVATION")),
+            report: Ok(complete("install: sshd restarted; it accepts SSH_BROKER_ELEVATION")),
             remove: Ok(()),
         }
     }
@@ -91,12 +91,12 @@ fn calls(log: &Log) -> Vec<String> {
         .collect()
 }
 
-const HANDED_OVER: &str = "apply: sshd's configuration is set up by the task ssh-broker-apply-sshd, which runs as SYSTEM and \
-     finishes even if this apply is ended; what it does follows when it has finished, and can be read while it \
-     runs in C:\\ProgramData\\ssh-broker\\apply-sshd.log";
+const HANDED_OVER: &str = "install: sshd's configuration is set up by the task ssh-broker-install-sshd, which runs as SYSTEM and \
+     finishes even if this install is ended; what it does follows when it has finished, and can be read while it \
+     runs in C:\\ProgramData\\ssh-broker\\install-sshd.log";
 
 /// What is said of a report that has no closing line, which says both things it can mean.
-const NO_CLOSING_LINE: &str = "apply: the report of the task ssh-broker-apply-sshd has no closing line: the task was \
+const NO_CLOSING_LINE: &str = "install: the report of the task ssh-broker-install-sshd has no closing line: the task was \
      ended before its step finished, or a line of the report could not be written; what it had said follows. Check \
      sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.";
 
@@ -107,7 +107,7 @@ fn the_task_is_registered_run_waited_for_read_and_removed_in_that_order_and_its_
     let log = new_log();
     let mut fake = Fake::new(&log);
     fake.report = Ok(complete(
-        "apply: a first line\napply: sshd restarted; it accepts SSH_BROKER_ELEVATION",
+        "install: a first line\ninstall: sshd restarted; it accepts SSH_BROKER_ELEVATION",
     ));
     let log = run(&mut fake);
     assert_eq!(
@@ -118,8 +118,8 @@ fn the_task_is_registered_run_waited_for_read_and_removed_in_that_order_and_its_
             &format!("said: {HANDED_OVER}"),
             "task: wait",
             "task: report",
-            "said: apply: a first line",
-            "said: apply: sshd restarted; it accepts SSH_BROKER_ELEVATION",
+            "said: install: a first line",
+            "said: install: sshd restarted; it accepts SSH_BROKER_ELEVATION",
             "task: remove",
         ]
     );
@@ -127,8 +127,8 @@ fn the_task_is_registered_run_waited_for_read_and_removed_in_that_order_and_its_
 
 #[test]
 fn the_hand_over_is_said_after_the_task_runs_and_before_anything_waits_for_it() {
-    // A stop of `apply` that comes after this line leaves the task running to its end: the line is what a
-    // caller that ends `apply` waits for.
+    // A stop of `install` that comes after this line leaves the task running to its end: the line is what a
+    // caller that ends `install` waits for.
     let log = new_log();
     let mut fake = Fake::new(&log);
     let log = run(&mut fake);
@@ -141,10 +141,10 @@ fn the_hand_over_is_said_after_the_task_runs_and_before_anything_waits_for_it() 
 #[test]
 fn the_hand_over_names_the_report_it_is_given() {
     assert_eq!(
-        handed_over_line(Path::new(r"D:\x\apply-sshd.log")),
-        "apply: sshd's configuration is set up by the task ssh-broker-apply-sshd, which runs as SYSTEM and \
-         finishes even if this apply is ended; what it does follows when it has finished, and can be read while \
-         it runs in D:\\x\\apply-sshd.log"
+        handed_over_line(Path::new(r"D:\x\install-sshd.log")),
+        "install: sshd's configuration is set up by the task ssh-broker-install-sshd, which runs as SYSTEM and \
+         finishes even if this install is ended; what it does follows when it has finished, and can be read while \
+         it runs in D:\\x\\install-sshd.log"
     );
     assert!(HANDED_OVER.starts_with(HANDED_OVER_PREFIX));
 }
@@ -155,9 +155,9 @@ fn the_hand_over_names_the_report_it_is_given() {
 fn a_report_that_ends_with_the_closing_line_is_complete_and_the_closing_line_is_not_printed() {
     let log = new_log();
     let mut fake = Fake::new(&log);
-    fake.report = Ok(complete("apply: a first line\napply: a second line"));
+    fake.report = Ok(complete("install: a first line\ninstall: a second line"));
     let log = run(&mut fake);
-    assert_eq!(said(&log)[1..], ["apply: a first line", "apply: a second line"]);
+    assert_eq!(said(&log)[1..], ["install: a first line", "install: a second line"]);
     assert!(
         said(&log).iter().all(|line| line != REPORT_END),
         "the closing line is for the reader, not for the person"
@@ -173,11 +173,14 @@ fn a_report_that_ends_with_the_closing_line_is_complete_and_the_closing_line_is_
 fn a_report_without_the_closing_line_is_said_to_be_incomplete_before_what_it_had_said() {
     let log = new_log();
     let mut fake = Fake::new(&log);
-    fake.report = Ok(unclosed("apply: sshd is running with its earlier configuration"));
+    fake.report = Ok(unclosed("install: sshd is running with its earlier configuration"));
     let log = run(&mut fake);
     assert_eq!(
         said(&log)[1..],
-        [NO_CLOSING_LINE, "apply: sshd is running with its earlier configuration",]
+        [
+            NO_CLOSING_LINE,
+            "install: sshd is running with its earlier configuration",
+        ]
     );
     assert_eq!(calls(&log), ["register", "run", "wait", "report", "remove"]);
 
@@ -196,7 +199,7 @@ fn an_incomplete_report_with_no_line_says_the_task_had_said_nothing() {
         said(&log)[1..],
         [
             NO_CLOSING_LINE,
-            "apply: the task ssh-broker-apply-sshd had said nothing",
+            "install: the task ssh-broker-install-sshd had said nothing",
         ]
     );
     assert_eq!(calls(&log), ["register", "run", "wait", "report", "remove"]);
@@ -210,7 +213,7 @@ fn a_closing_line_with_nothing_before_it_is_a_step_that_had_nothing_to_change() 
     let log = run(&mut fake);
     assert_eq!(
         said(&log)[1..],
-        ["apply: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change"]
+        ["install: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change"]
     );
     assert_eq!(calls(&log).last().unwrap(), "remove");
 }
@@ -234,7 +237,7 @@ fn a_task_that_cannot_be_registered_is_said_to_have_changed_nothing_and_nothing_
     assert_eq!(
         said(&log),
         [
-            "apply: sshd was not set up to accept SSH_BROKER_ELEVATION: the task ssh-broker-apply-sshd could not \
+            "install: sshd was not set up to accept SSH_BROKER_ELEVATION: the task ssh-broker-install-sshd could not \
              be registered: access denied. Nothing of sshd's was changed; `ssh-broker elevate` works without it."
         ]
     );
@@ -254,7 +257,7 @@ fn a_task_that_cannot_be_started_is_said_so_and_removed() {
     assert_eq!(
         said(&log),
         [
-            "apply: sshd was not set up to accept SSH_BROKER_ELEVATION: the task ssh-broker-apply-sshd could not \
+            "install: sshd was not set up to accept SSH_BROKER_ELEVATION: the task ssh-broker-install-sshd could not \
              be started: the task is disabled. Nothing of sshd's was changed; `ssh-broker elevate` works without it."
         ]
     );
@@ -272,8 +275,8 @@ fn a_task_that_cannot_be_started_and_cannot_be_removed_says_both() {
     assert_eq!(said.len(), 2, "{said:#?}");
     assert_eq!(
         said[1],
-        "apply: the task ssh-broker-apply-sshd could not be removed (access denied); it has no trigger, runs \
-         nothing by itself, and the next apply replaces it"
+        "install: the task ssh-broker-install-sshd could not be removed (access denied); it has no trigger, runs \
+         nothing by itself, and the next install replaces it"
     );
 }
 
@@ -286,7 +289,7 @@ fn a_missing_report_is_said_and_the_task_is_still_removed() {
     assert_eq!(
         said(&log).last().unwrap(),
         &format!(
-            "apply: the report of the task ssh-broker-apply-sshd could not be read in {REPORT} (the system cannot \
+            "install: the report of the task ssh-broker-install-sshd could not be read in {REPORT} (the system cannot \
              find the file specified); if it is not there, the task did not start or could not create it. Whether \
              sshd accepts SSH_BROKER_ELEVATION and is running is not known: `ssh-broker doctor` says, and `sc query \
              sshd` shows whether sshd runs"
@@ -304,13 +307,13 @@ fn a_task_that_cannot_be_removed_is_said_so_after_its_report() {
     let said = said(&log);
     assert_eq!(
         said[said.len() - 2],
-        "apply: sshd restarted; it accepts SSH_BROKER_ELEVATION",
+        "install: sshd restarted; it accepts SSH_BROKER_ELEVATION",
         "the report's last line stays the line before"
     );
     assert_eq!(
         said.last().unwrap(),
-        "apply: the task ssh-broker-apply-sshd could not be removed (access denied); it has no trigger, runs \
-         nothing by itself, and the next apply replaces it"
+        "install: the task ssh-broker-install-sshd could not be removed (access denied); it has no trigger, runs \
+         nothing by itself, and the next install replaces it"
     );
 }
 
@@ -323,7 +326,7 @@ fn an_instance_that_was_listed_and_never_launched_is_taken_as_proof_of_nothing()
     assert_eq!(
         said(&log).last().unwrap(),
         &format!(
-            "apply: the Task Scheduler lists an instance of the task {TASK} that it has not started; it may still \
+            "install: the Task Scheduler lists an instance of the task {TASK} that it has not started; it may still \
              run, and nothing is known of what it does. Its report is {REPORT}. End and remove the task (`schtasks \
              /End /TN {TASK}`, then `schtasks /Delete /TN {TASK} /F`, elevated) when it is not wanted; if the step \
              has started meanwhile, ending it can leave sshd stopped. Check sshd at this PC: `sc query sshd`; start \
@@ -346,7 +349,7 @@ fn a_wait_that_fails_leaves_the_task_and_says_it_may_still_run() {
     assert_eq!(
         said(&log).last().unwrap(),
         &format!(
-            "apply: waiting for the task {TASK} failed (the Task Scheduler did not answer); it may still run. Its \
+            "install: waiting for the task {TASK} failed (the Task Scheduler did not answer); it may still run. Its \
              report is {REPORT}"
         )
     );
@@ -359,14 +362,14 @@ fn a_wait_that_fails_leaves_the_task_and_says_it_may_still_run() {
 fn the_verb_writes_each_line_to_the_report_whole_before_it_goes_on() {
     let dir = std::env::temp_dir().join(format!("sb-report-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("apply-sshd.log");
+    let path = dir.join("install-sshd.log");
     std::fs::write(&path, "left from an earlier run\r\n").unwrap();
 
     let mut seen_by_a_reader = Vec::new();
     write_report(&path, |say| {
-        say("apply: first");
+        say("install: first");
         seen_by_a_reader.push(std::fs::read_to_string(&path).unwrap());
-        say("apply: second");
+        say("install: second");
         seen_by_a_reader.push(std::fs::read_to_string(&path).unwrap());
     })
     .unwrap();
@@ -374,7 +377,7 @@ fn the_verb_writes_each_line_to_the_report_whole_before_it_goes_on() {
 
     assert_eq!(
         seen_by_a_reader,
-        ["apply: first\r\n", "apply: first\r\napply: second\r\n"],
+        ["install: first\r\n", "install: first\r\ninstall: second\r\n"],
         "a line is in the file when `say` returns, and the earlier run's text is gone"
     );
 }
@@ -383,11 +386,11 @@ fn the_verb_writes_each_line_to_the_report_whole_before_it_goes_on() {
 fn the_closing_line_is_written_only_after_the_step_has_returned() {
     let dir = std::env::temp_dir().join(format!("sb-report-end-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("apply-sshd.log");
+    let path = dir.join("install-sshd.log");
 
     let mut inside = None;
     write_report(&path, |say| {
-        say("apply: first");
+        say("install: first");
         inside = Some(Report::parse(&std::fs::read_to_string(&path).unwrap()));
     })
     .unwrap();
@@ -400,12 +403,12 @@ fn the_closing_line_is_written_only_after_the_step_has_returned() {
         !inside.complete,
         "while the step runs the file does not say that it is whole"
     );
-    assert_eq!(inside.lines, ["apply: first"]);
+    assert_eq!(inside.lines, ["install: first"]);
     assert!(after.complete);
-    assert_eq!(after.lines, ["apply: first"]);
+    assert_eq!(after.lines, ["install: first"]);
     assert_eq!(
         raw,
-        format!("apply: first\r\n{REPORT_END}\r\n"),
+        format!("install: first\r\n{REPORT_END}\r\n"),
         "the last line of the file"
     );
 }
@@ -439,9 +442,9 @@ fn a_line_that_cannot_be_written_leaves_the_report_without_a_closing_line_and_is
     };
     let mut said = Vec::new();
     let err = write_lines(&mut out, |say| {
-        say("apply: first");
-        say("apply: second");
-        say("apply: third");
+        say("install: first");
+        say("install: second");
+        say("install: third");
         said.push("the step ran to its end");
     })
     .unwrap_err();
@@ -453,7 +456,7 @@ fn a_line_that_cannot_be_written_leaves_the_report_without_a_closing_line_and_is
     );
     assert_eq!(
         String::from_utf8(out.written).unwrap(),
-        "apply: first\r\n",
+        "install: first\r\n",
         "no closing line follows a failed one: the report says it is not whole"
     );
 }
@@ -464,7 +467,7 @@ fn a_closing_line_that_cannot_be_written_is_the_error() {
         accepts: 1,
         written: Vec::new(),
     };
-    let err = write_lines(&mut out, |say| say("apply: first")).unwrap_err();
+    let err = write_lines(&mut out, |say| say("install: first")).unwrap_err();
     assert_eq!(err.to_string(), "the disk is full");
     let text = String::from_utf8(out.written).unwrap();
     assert!(!text.contains(REPORT_END), "{text}");
@@ -474,12 +477,12 @@ fn a_closing_line_that_cannot_be_written_is_the_error() {
 fn a_report_that_cannot_be_written_is_an_error_and_the_step_does_not_run() {
     let missing = std::env::temp_dir()
         .join(format!("sb-no-such-dir-{}", std::process::id()))
-        .join("apply-sshd.log");
+        .join("install-sshd.log");
     let mut ran = false;
     let err = write_report(&missing, |_| ran = true).unwrap_err();
     assert!(
         !ran,
         "no report to write to, so nothing is run that nobody could read about"
     );
-    assert!(format!("{err:#}").contains("apply-sshd.log"), "{err:#}");
+    assert!(format!("{err:#}").contains("install-sshd.log"), "{err:#}");
 }

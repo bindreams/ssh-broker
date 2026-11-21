@@ -1,7 +1,7 @@
-//! The system config `apply` creates from the shell sshd used before: what it carries, and the
+//! The system config `install` creates from the shell sshd used before: what it carries, and the
 //! one-time, atomic creation.
 //!
-//! `apply` is about to make ssh-broker sshd's `DefaultShell`, which loses the old value. The old
+//! `install` is about to make ssh-broker sshd's `DefaultShell`, which loses the old value. The old
 //! shell, with the options sshd ran it with, is written once to `config.yaml` in the install
 //! directory so that sessions keep starting the same shell. Only values that differ from what
 //! ssh-broker defaults to for that program are written, so the file says what the user's setup
@@ -94,7 +94,7 @@ fn split_arguments(arguments: &str) -> Option<Vec<String>> {
 /// Why nothing is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Skip {
-    /// The previous shell is ssh-broker's own (an `apply` over an install) or none (sshd ran the system
+    /// The previous shell is ssh-broker's own (an `install` over an install) or none (sshd ran the system
     /// `cmd.exe`, which is the built-in): see [`nothing_to_carry`].
     NothingToCarry,
     /// A config is already there, and is never rewritten.
@@ -122,7 +122,7 @@ pub enum Decision {
 /// Finds the directories sshd searches for a bare shell name, or says why they are not known.
 pub type SearchDirs<'a> = dyn Fn() -> Result<Vec<PathBuf>, String> + 'a;
 
-/// Whether `apply` writes the config, and what. `config_is_file` is what is at its path (see
+/// Whether `install` writes the config, and what. `config_is_file` is what is at its path (see
 /// [`config_is_file`]), or why that is not known. `search_dirs` is called only once the decision needs the directories, so
 /// a failure to find them is not reported when nothing depends on it. `find` finds the file the
 /// previous shell names in them, as sshd finds it ([`sshd_search_dirs`]), or says why there is none;
@@ -163,7 +163,7 @@ pub fn decide(
     Decision::Write(block)
 }
 
-/// The values of the shell `apply` replaces, as they are in the registry: what nothing else keeps.
+/// The values of the shell `install` replaces, as they are in the registry: what nothing else keeps.
 fn previous_values(previous: &SshdShell) -> String {
     let value = |value: &Option<String>| value.as_ref().map_or("not set".to_owned(), |v| format!("\"{v}\""));
     let escape = if previous.escape_arguments { "yes" } else { "no" };
@@ -176,12 +176,12 @@ fn previous_values(previous: &SshdShell) -> String {
     )
 }
 
-/// The warning for a previous shell that is not carried. `apply` prints it before it replaces
-/// `DefaultShell`, which can still fail, so it says what `apply` does next and holds every value of
+/// The warning for a previous shell that is not carried. `install` prints it before it replaces
+/// `DefaultShell`, which can still fail, so it says what `install` does next and holds every value of
 /// the shell, which nothing else keeps. `reason` says why it is not carried.
 fn not_carried(config: &Path, previous: &SshdShell, reason: &str) -> String {
     format!(
-        "apply: {reason}. This apply does not carry the shell sshd used before into {config}. apply replaces \
+        "install: {reason}. This install does not carry the shell sshd used before into {config}. install replaces \
          DefaultShell next. Previous values under HKLM\\{key}: {values}",
         config = config.display(),
         key = super::registry::OPENSSH_KEY,
@@ -199,12 +199,12 @@ pub fn not_written(config: &Path, previous: &SshdShell, cause: &str) -> String {
 }
 
 /// Whether replacing `previous` loses nothing: sshd ran no shell of its own (the built-in `cmd.exe`) or
-/// ssh-broker. The one place `apply` asks this.
+/// ssh-broker. The one place `install` asks this.
 pub fn nothing_to_carry(previous: &SshdShell) -> bool {
     previous.shell.as_deref().is_none_or(super::is_ssh_broker)
 }
 
-/// The warning for a [`Skip`] that leaves the previous shell uncarried while `apply` replaces it.
+/// The warning for a [`Skip`] that leaves the previous shell uncarried while `install` replaces it.
 /// [`Skip::NothingToCarry`] is no reason for a shell that has something to carry, and says so.
 pub fn skip_notice(config: &Path, previous: &SshdShell, skip: &Skip) -> String {
     let reason = match skip {
@@ -237,7 +237,7 @@ pub enum ConfigKind {
 
 /// What is at `config`, or why that is not known: a failed check is not an absent file, so the cause
 /// is kept and worded as one that cannot tell. A name that exists is never `Missing`, whatever its
-/// target. The one answer to "is the system config there" in `apply`.
+/// target. The one answer to "is the system config there" in `install`.
 pub fn config_is_file(config: &Path) -> Result<ConfigKind, String> {
     let cannot_tell = |e: std::io::Error| format!("cannot tell whether {} is a file: {e}", config.display());
     let not_found = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
@@ -256,12 +256,12 @@ pub fn config_is_file(config: &Path) -> Result<ConfigKind, String> {
     }
 }
 
-/// What `apply` does with `DefaultShellArguments` once `DefaultShell` is ssh-broker.
+/// What `install` does with `DefaultShellArguments` once `DefaultShell` is ssh-broker.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ArgumentsPlan {
     /// Sshd ignores the value (absent, empty or too long): nothing to pass on.
     Nothing,
-    /// The value stays; the string is what `apply` says about it.
+    /// The value stays; the string is what `install` says about it.
     Leave(String),
     /// The value is removed; the string is how it was read, for the notice.
     Remove(String),
@@ -299,38 +299,38 @@ pub fn plan_arguments(
     }
 }
 
-/// The notice for a `DefaultShellArguments` `apply` leaves: `DefaultShell` is ssh-broker by now, `why`
+/// The notice for a `DefaultShellArguments` `install` leaves: `DefaultShell` is ssh-broker by now, `why`
 /// says why the value stays, and `value` is how it was read.
 pub fn arguments_left(key: &str, value: &str, why: &str) -> String {
-    format!("apply: left DefaultShellArguments ({value}) under HKLM\\{key}: {why}")
+    format!("install: left DefaultShellArguments ({value}) under HKLM\\{key}: {why}")
 }
 
-/// The notice for a `DefaultShellArguments` `apply` leaves because it could not read it, with the `cause`.
+/// The notice for a `DefaultShellArguments` `install` leaves because it could not read it, with the `cause`.
 /// What sshd does with a value nobody could read is not known, so the text says none of it.
 pub fn arguments_unreadable(key: &str, cause: &str) -> String {
-    format!("apply: left DefaultShellArguments under HKLM\\{key}: it could not be read ({cause})")
+    format!("install: left DefaultShellArguments under HKLM\\{key}: it could not be read ({cause})")
 }
 
-/// The text `apply` emits before it removes `DefaultShellArguments`, with the `value` as it was read.
+/// The text `install` emits before it removes `DefaultShellArguments`, with the `value` as it was read.
 pub fn arguments_removing(key: &str, value: &str) -> String {
-    format!("apply: removing DefaultShellArguments ({value}) from HKLM\\{key}")
+    format!("install: removing DefaultShellArguments ({value}) from HKLM\\{key}")
 }
 
-/// The notice for a `DefaultShellArguments` `apply` removed.
+/// The notice for a `DefaultShellArguments` `install` removed.
 pub fn arguments_removed(key: &str, value: &str) -> String {
-    format!("apply: removed DefaultShellArguments ({value}) from HKLM\\{key}")
+    format!("install: removed DefaultShellArguments ({value}) from HKLM\\{key}")
 }
 
-/// The notice for a `DefaultShellArguments` `apply` could not remove, with the `cause`.
+/// The notice for a `DefaultShellArguments` `install` could not remove, with the `cause`.
 pub fn arguments_not_removed(key: &str, value: &str, cause: &str) -> String {
-    format!("apply: could not remove DefaultShellArguments ({value}) from HKLM\\{key}: {cause}")
+    format!("install: could not remove DefaultShellArguments ({value}) from HKLM\\{key}: {cause}")
 }
 
 /// The directories sshd's `CreateProcess` searches for a bare `DefaultShell` before `PATH`, in its
 /// order: the directory of sshd itself (`image_path`, the service's `ImagePath`, when it is known),
 /// the system directory and the Windows directory. The working directory is not listed: sshd's is not
 /// the system directory but the drive root (the service) or the account's profile (the process running as
-/// the account), as `tests/shell_sshd_windows.rs` measures, and `apply` runs for no one account.
+/// the account), as `tests/shell_sshd_windows.rs` measures, and `install` runs for no one account.
 pub fn sshd_search_dirs(host: &dyn Host, image_path: Option<&str>) -> anyhow::Result<Vec<PathBuf>> {
     let system_dir = host
         .system_cmd()?
@@ -396,8 +396,8 @@ pub(super) fn image_dir(image_path: &str) -> Option<PathBuf> {
 pub fn render(block: &ShellBlock) -> anyhow::Result<String> {
     let body = render_file(block).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(format!(
-        "# Created once by `ssh-broker apply` from the shell sshd used before ssh-broker. Edit it freely;\n\
-         # `apply` never rewrites it. `ssh-broker doctor` shows the shell in effect.\n{body}"
+        "# Created once by `ssh-broker install` from the shell sshd used before ssh-broker. Edit it freely;\n\
+         # `install` never rewrites it. `ssh-broker doctor` shows the shell in effect.\n{body}"
     ))
 }
 

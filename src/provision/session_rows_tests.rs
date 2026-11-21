@@ -139,7 +139,11 @@ fn what_the_probe_said_about_its_token_is_on_the_row_instead_of_the_remedy() {
         assert!(!rows[0].pass, "{asked:?}");
         assert!(rows[0].detail.contains(said), "{asked:?}: {}", rows[0].detail);
         assert!(rows[0].detail.contains(missing), "{asked:?}: {}", rows[0].detail);
-        assert!(!rows[0].detail.contains("apply"), "{asked:?}: {}", rows[0].detail);
+        assert!(
+            !rows[0].detail.contains("re-run `install`"),
+            "{asked:?}: {}",
+            rows[0].detail
+        );
     }
 
     let asked = ProbeOutcome::Answered(Answer {
@@ -149,7 +153,7 @@ fn what_the_probe_said_about_its_token_is_on_the_row_instead_of_the_remedy() {
     let rows = session_rows(&answer(unelevated()), Some(&asked));
     assert!(!rows[1].pass);
     assert!(rows[1].detail.contains("access denied"), "{}", rows[1].detail);
-    assert!(!rows[1].detail.contains("apply"), "{}", rows[1].detail);
+    assert!(!rows[1].detail.contains("re-run `install`"), "{}", rows[1].detail);
 }
 
 /// A probe that said nothing about its token or its level is named for that, with the remedy, and not
@@ -158,7 +162,7 @@ fn what_the_probe_said_about_its_token_is_on_the_row_instead_of_the_remedy() {
 fn a_probe_that_did_not_report_its_token_or_level_says_so_and_does_not_blame_the_session() {
     let rows = session_rows(&answer(unelevated()), Some(&answered(probe(None, None))));
     assert!(rows[1].detail.contains("did not report"), "{}", rows[1].detail);
-    assert!(rows[1].detail.contains("apply"), "{}", rows[1].detail);
+    assert!(rows[1].detail.contains("re-run `install`"), "{}", rows[1].detail);
 
     let rows = session_rows(
         &answer(unelevated()),
@@ -408,7 +412,7 @@ fn a_probe_that_reported_no_junction_outcome_fails_the_junction_row() {
 
     assert!(!row.pass, "{}", row.detail);
     assert!(row.detail.contains("did not report"), "{}", row.detail);
-    assert!(row.detail.contains("apply"), "{}", row.detail);
+    assert!(row.detail.contains("re-run `install`"), "{}", row.detail);
 }
 
 /// A directory that could not be made is a failure, with the cause the probe gave; it is not the volume

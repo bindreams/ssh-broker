@@ -57,7 +57,7 @@ struct Fake {
     /// The password each step was given, as the UTF-16 units it received.
     probed: std::cell::RefCell<Vec<Vec<u16>>>,
     registered: Vec<Vec<u16>>,
-    /// Whether the apply lock is held now, and how many times it was taken.
+    /// Whether the install lock is held now, and how many times it was taken.
     held: std::rc::Rc<std::cell::Cell<bool>>,
     locks: u32,
     /// Taking the lock fails with this message.
@@ -137,7 +137,7 @@ impl AutoLoginEnv for Fake {
     fn exe(&self) -> std::path::PathBuf {
         EXE.into()
     }
-    fn lock_apply(&mut self) -> anyhow::Result<Box<dyn std::any::Any>> {
+    fn lock_install(&mut self) -> anyhow::Result<Box<dyn std::any::Any>> {
         if let Some(why) = self.lock_fails {
             anyhow::bail!(why);
         }
@@ -464,10 +464,10 @@ fn off_twice_is_ok() {
     assert!(env.said().contains("already off"), "{}", env.said());
 }
 
-// the apply lock -----
+// the install lock -----
 
 #[test]
-fn on_holds_the_apply_lock_for_every_step_and_lets_go_at_the_end() {
+fn on_holds_the_install_lock_for_every_step_and_lets_go_at_the_end() {
     let mut env = Fake::new();
     on(&mut env, &alice()).unwrap();
     assert_eq!(env.locks, 1);
@@ -494,9 +494,9 @@ fn on_checks_the_install_before_the_prompt_and_again_under_the_lock() {
 #[test]
 fn on_with_no_install_refuses_before_the_prompt_and_takes_no_lock() {
     let mut env = Fake::new();
-    env.install_problem = Some("ssh-broker: the exe is not installed; run apply first");
+    env.install_problem = Some("ssh-broker: the exe is not installed; run install first");
     let text = error_text(on(&mut env, &alice()));
-    assert!(text.contains("run apply first"), "{text}");
+    assert!(text.contains("run install first"), "{text}");
     assert!(env.calls.is_empty(), "no password is asked for: {:?}", env.calls);
     assert_eq!(
         env.locks, 0,
@@ -505,13 +505,13 @@ fn on_with_no_install_refuses_before_the_prompt_and_takes_no_lock() {
 }
 
 #[test]
-fn on_does_not_hold_the_apply_lock_while_it_asks_for_the_password() {
+fn on_does_not_hold_the_install_lock_while_it_asks_for_the_password() {
     let mut env = Fake::new();
     on(&mut env, &alice()).unwrap();
     assert_eq!(
         env.held_when_asked,
         [false],
-        "a prompt left open must not hold up apply"
+        "a prompt left open must not hold up install"
     );
 }
 
@@ -525,7 +525,7 @@ fn on_with_a_cancelled_prompt_takes_no_lock() {
 }
 
 #[test]
-fn on_lets_go_of_the_apply_lock_when_it_fails_after_taking_it() {
+fn on_lets_go_of_the_install_lock_when_it_fails_after_taking_it() {
     let mut env = Fake::new();
     env.batch = BatchRight::Missing;
     on(&mut env, &alice()).unwrap_err();
@@ -535,7 +535,7 @@ fn on_lets_go_of_the_apply_lock_when_it_fails_after_taking_it() {
 }
 
 #[test]
-fn off_holds_the_apply_lock_for_its_step_and_lets_go_at_the_end() {
+fn off_holds_the_install_lock_for_its_step_and_lets_go_at_the_end() {
     let mut env = Fake::new();
     off(&mut env, &alice()).unwrap();
     assert_eq!(env.locks, 1);
@@ -642,12 +642,12 @@ fn off_deletes_the_task_without_the_lock_when_the_lock_cannot_be_taken_and_says_
 #[test]
 fn off_names_the_cause_of_a_lock_that_cannot_be_taken_once() {
     let mut env = Fake::new();
-    env.lock_fails = Some("ssh-broker: could not take the apply lock: the-lock-path cannot be trusted");
+    env.lock_fails = Some("ssh-broker: could not take the install lock: the-lock-path cannot be trusted");
     off(&mut env, &alice()).unwrap();
     let warning = env.said.first().expect("a warning").clone();
     assert_eq!(
         warning,
-        "ssh-broker: warning: could not take the apply lock: the-lock-path cannot be trusted; deleting the task anyway."
+        "ssh-broker: warning: could not take the install lock: the-lock-path cannot be trusted; deleting the task anyway."
     );
 }
 
@@ -721,10 +721,10 @@ fn env_in(base: &std::path::Path, on_lock_wait: impl FnMut() + 'static) -> Windo
 }
 
 #[test]
-fn check_install_with_no_install_directory_says_run_apply_first_and_creates_nothing() {
+fn check_install_with_no_install_directory_says_run_install_first_and_creates_nothing() {
     let dir = TempPath::new("check-missing");
     let text = format!("{:#}", env_in(&dir.0, || {}).check_install().unwrap_err());
-    assert!(text.contains("is not installed; run apply first"), "{text}");
+    assert!(text.contains("is not installed; run install first"), "{text}");
     assert!(text.contains("ssh-broker.exe"), "it names the exe: {text}");
     assert!(!dir.0.exists(), "looking must create no directory and no lock file");
 }
@@ -765,13 +765,14 @@ fn the_real_env_tells_a_missing_install_directory_from_a_trusted_one() {
     assert_eq!(env.install_dir(), InstallDir::Trusted);
 }
 
-/// Elevated (CI only). The lock `auto-login on|off` take is the file `apply` takes: with another
-/// holder on `apply.lock`, the real env's `lock_apply` blocks (and says so) until it lets go.
+/// Elevated (CI only). The lock `auto-login on|off` take is the file `install` takes: with another
+/// holder on the lock file, the real env's `lock_install` blocks (and says so) until it lets go.
 #[test]
-fn the_real_env_waits_for_a_holder_of_the_apply_lock_file() {
+fn the_real_env_waits_for_a_holder_of_the_install_lock_file() {
     let (dir, layout) = hardened_layout("env-waits");
     let holder =
-        crate::provision::apply_lock::acquire(&layout.apply_lock_path(), || panic!("nobody holds the lock")).unwrap();
+        crate::provision::install_lock::acquire(&layout.install_lock_path(), || panic!("nobody holds the lock"))
+            .unwrap();
     let (events, seen) = std::sync::mpsc::channel();
     let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let asker = std::thread::spawn({
@@ -780,7 +781,7 @@ fn the_real_env_waits_for_a_holder_of_the_apply_lock_file() {
         move || {
             let waiting = events.clone();
             let mut env = env_in(&base, move || waiting.send(Lock::Waiting).unwrap());
-            let lock = env.lock_apply().unwrap();
+            let lock = env.lock_install().unwrap();
             let after_release = released.load(std::sync::atomic::Ordering::SeqCst);
             events.send(Lock::Taken).unwrap();
             drop(lock);
@@ -790,31 +791,31 @@ fn the_real_env_waits_for_a_holder_of_the_apply_lock_file() {
     assert_eq!(
         seen.recv().expect("the asker ended without reporting"),
         Lock::Waiting,
-        "lock_apply returned, or did not report a wait, while the apply lock file was held"
+        "lock_install returned, or did not report a wait, while the install lock file was held"
     );
     released.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(holder);
     assert_eq!(seen.recv().expect("the asker never got the lock"), Lock::Taken);
     assert!(
         asker.join().unwrap(),
-        "lock_apply reported a wait and then returned before the holder let go"
+        "lock_install reported a wait and then returned before the holder let go"
     );
 }
 
-/// Elevated (CI only). The guard `lock_apply` returns is the lock: while it lives, a second taker
-/// of `apply.lock` blocks; once it is dropped, the second gets it.
+/// Elevated (CI only). The guard `lock_install` returns is the lock: while it lives, a second taker
+/// of the lock file blocks; once it is dropped, the second gets it.
 #[test]
-fn the_real_env_holds_the_apply_lock_file_until_its_guard_is_dropped() {
+fn the_real_env_holds_the_install_lock_file_until_its_guard_is_dropped() {
     let (dir, layout) = hardened_layout("env-holds");
     let mut env = env_in(&dir.0, || panic!("nobody holds the lock"));
-    let guard = env.lock_apply().unwrap();
+    let guard = env.lock_install().unwrap();
     let (events, seen) = std::sync::mpsc::channel();
     let second = std::thread::spawn({
-        let path = layout.apply_lock_path();
+        let path = layout.install_lock_path();
         move || {
             let waiting = events.clone();
             let lock =
-                crate::provision::apply_lock::acquire(&path, move || waiting.send(Lock::Waiting).unwrap()).unwrap();
+                crate::provision::install_lock::acquire(&path, move || waiting.send(Lock::Waiting).unwrap()).unwrap();
             events.send(Lock::Taken).unwrap();
             drop(lock);
         }
