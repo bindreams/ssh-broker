@@ -26,7 +26,7 @@ use ssh_broker::provision::sshd_config::restart::{ServiceState, StartOutcome, St
 use ssh_broker::provision::sshd_config::{
     ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, SshdReading, accepts, accepts_row, drop_in_text, in_force, with_line,
 };
-use ssh_broker::provision::sshd_task;
+use ssh_broker::provision::sshd_task::{self, render};
 use ssh_broker::provision::{BASE_DIR, canonical_exe, installed_line, version};
 use ssh_broker::provision::{schtasks, taskscheduler};
 use ssh_broker::socket_loc::Elevation;
@@ -70,20 +70,21 @@ use stand_in::Kit;
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-/// What `install`'s sshd step did and said: whether the running sshd takes the variable, and its lines.
+/// What `install`'s sshd step did and said: whether the running sshd takes the variable, and its lines as the
+/// report holds them (a warning begins with `warning: `, a note with nothing).
 fn configure() -> (bool, Vec<String>) {
     let mut said = Vec::new();
-    let accepted = configure_this_machine(&mut |line| said.push(line.to_owned()));
+    let accepted = configure_this_machine(&mut |kind, text| said.push(render(kind, text)));
     (accepted, said)
 }
 
 /// A step that changed a file of sshd's configuration under a running sshd: it restarted the service, and says
-/// that sshd restarted and accepts the variable.
+/// in a note that sshd restarted and accepts the variable.
 fn assert_restarted(accepted: bool, said: &[String]) {
     assert!(accepted, "{said:#?}");
     assert_eq!(
         said.last().expect("the step said nothing"),
-        "install: sshd restarted; it accepts SSH_BROKER_ELEVATION",
+        "sshd restarted; it accepts SSH_BROKER_ELEVATION",
         "{said:#?}"
     );
 }
@@ -159,6 +160,11 @@ fn report() -> sshd_task::Report {
     sshd_task::Report::parse(&text)
 }
 
+/// The lines of `report`, as the report file holds them.
+fn rendered(report: &sshd_task::Report) -> Vec<String> {
+    report.lines.iter().map(|line| render(line.kind, &line.text)).collect()
+}
+
 /// No task of the sshd step is left registered.
 fn assert_no_sshd_task_is_left() {
     assert_eq!(
@@ -177,8 +183,9 @@ fn system_cmd() -> PathBuf {
 
 /// The step on the runner's stock file, run by `install` through its task, as SYSTEM: the drop-in, the `Include` line
 /// above the first `Match`, the original's security on the replacement (SYSTEM can create the drop-in and
-/// `copy_file_security` works as SYSTEM), and the restart of sshd. No task is left after `install`, and the report
-/// holds the lines `install` printed after it said the step was the task's. After the restart the `doctor` row
+/// `copy_file_security` works as SYSTEM), and the restart of sshd. No task is left after `install`. A healthy first
+/// install says the step line, last before the installed line, and nothing of the step on standard error. Every line on standard output but
+/// the last ends in `...`, and no line on either stream begins with `install`. After the restart the `doctor` row
 /// passes and a second run says nothing.
 #[test]
 fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_the_row_passes() {
@@ -190,21 +197,48 @@ fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_an
     let kit = Kit::broker_with_helper("sshs");
     let security_before = sddl_of(&config_path());
 
-    let (stdout, _) = install_streams(&kit);
+    let (stdout, stderr) = install_streams(&kit);
     let installed = installed_line(version());
+    let out_lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(
-        stdout.lines().last(),
-        Some(installed.as_str()),
+        out_lines.last(),
+        Some(&installed.as_str()),
         "install's last line says it is installed:\n{stdout}"
     );
-    let printed: Vec<&str> = stdout
-        .lines()
-        .skip_while(|line| !line.starts_with(sshd_task::HANDED_OVER_PREFIX))
-        .skip(1)
-        .take_while(|line| *line != installed)
-        .collect();
-    let said = report().lines;
-    assert_eq!(printed, said, "install prints the report, line for line");
+    assert_eq!(
+        out_lines[out_lines.len() - 2],
+        sshd_task::step_line(&sshd_task::report_path()),
+        "the step line is the last before the installed line, and names the report:\n{stdout}"
+    );
+    for line in &out_lines[..out_lines.len() - 1] {
+        assert!(line.ends_with("..."), "a step line says that it is going on: {line}");
+    }
+    for line in stdout.lines().chain(stderr.lines()) {
+        let first = line.split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default();
+        assert!(
+            !first.eq_ignore_ascii_case("install"),
+            "a line begins with the verb: {line}"
+        );
+    }
+    let report = report();
+    assert!(
+        report.complete,
+        "the report ends with its closing line: {:#?}",
+        report.lines
+    );
+    assert_eq!(
+        report.warnings().collect::<Vec<_>>(),
+        Vec::<&str>::new(),
+        "a healthy first install reports no warning"
+    );
+    // `hand_over`'s own warnings all name the task, so the check for its name excludes them too.
+    for line in stderr.lines() {
+        assert!(
+            !line.contains(schtasks::INSTALL_SSHD_TASK) && report.lines.iter().all(|reported| reported.text != line),
+            "standard error holds a line of the sshd step: {line}"
+        );
+    }
+    let said = rendered(&report);
     assert_restarted(true, &said);
     assert_no_sshd_task_is_left();
     assert_eq!(
@@ -233,6 +267,41 @@ fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_an
     // A second run changes nothing: sshd started after every file was written, so the step has nothing to say.
     let (again, said) = configure();
     assert!(again && said.is_empty(), "{said:#?}");
+}
+
+/// A warning of the step is on standard error. A drop-in that sshd rejects makes `sshd_config` need a line added by
+/// hand: the step says in one warning which line to add, and `install` shows that warning on standard error, where
+/// the report (which `install` ran as the task) holds it too. The step line is on standard output.
+#[test]
+fn install_says_on_standard_error_which_line_to_add_when_sshd_config_cannot_be_edited() {
+    let _machine = machine::exclusive();
+    account_fixture::assert_elevated();
+    let _install = Install::capture();
+    let _running = SshdRunningAtTheEnd;
+    reset();
+    let _reset = ResetAtTheEnd;
+    create_install_dir(&drop_in_dir()).expect("make the drop-in folder");
+    std::fs::write(drop_in_dir().join("99-broken.conf"), "ThisIsNotAnSshdOption yes\r\n").unwrap();
+    let kit = Kit::broker_with_helper("sshw");
+
+    let (stdout, stderr) = install_streams(&kit);
+    let report = report();
+    let advice: Vec<&str> = report
+        .warnings()
+        .filter(|warning| warning.contains(ACCEPT_LINE) && warning.contains("above the first `Match`"))
+        .collect();
+    assert_eq!(advice.len(), 1, "{:#?}", report.lines);
+    assert!(
+        stderr.lines().any(|line| line == advice[0]),
+        "the warning is on standard error:\n{stderr}\n{advice:?}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with(sshd_task::HANDED_OVER_PREFIX)),
+        "the step line is on standard output:\n{stdout}"
+    );
+    assert_no_sshd_task_is_left();
 }
 
 /// An `Include` that covers the drop-in is already there: the file is not touched and the variable is accepted
@@ -1032,9 +1101,9 @@ fn an_install_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_
         report.lines
     );
     assert_eq!(
-        report.lines.last().map(String::as_str),
-        Some("install: sshd restarted; it accepts SSH_BROKER_ELEVATION"),
-        "the report's last line says sshd restarted"
+        rendered(&report).last().map(String::as_str),
+        Some("sshd restarted; it accepts SSH_BROKER_ELEVATION"),
+        "the report's last line is the note that says sshd restarted"
     );
 
     // A new login gets the variable: the rig is made after the checks above, so that it cannot have configured

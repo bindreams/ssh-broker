@@ -1,14 +1,14 @@
 //! Host tests for the restart of sshd, over the stand-in of `configure_tests`: the service manager is a script of
 //! answers, one per call, and a call with no answer left panics, so a test that scripts none shows that nothing
 //! was asked. The real service manager is measured by `tests/sshd_config_windows.rs`, which CI runs.
-use super::super::configure::configure_tests::Fake;
+use super::super::configure::configure_tests::{Entry, Fake, Said, note, warning};
 use super::super::{DROP_IN_NAME, INCLUDE_LINE, drop_in_text, with_line};
 use super::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-const INTRO: &str = "install: restarting sshd; install waits for the service manager at each step, and after a start for \
-                     sshd to listen or exit";
+const INTRO: &str = "restarting sshd; install waits for the service manager at each step, and after a start for sshd to \
+                     listen or exit";
 const ELEVATION: &str = "SSH_BROKER_ELEVATION";
 const NOT_RUNNING_ADVICE: &str = "Start it at this PC: `net start sshd`.";
 
@@ -30,13 +30,14 @@ fn stopped_again(win32: u32, specific: u32) -> String {
     format!("the start was accepted and sshd stopped again (exit codes {win32} and {specific})")
 }
 
-fn restart_with(host: &mut Fake, before: &Before) -> (bool, Vec<String>) {
+/// Restart and return what was said with the result.
+fn restart_with(host: &mut Fake, before: &Before) -> (bool, Vec<Said>) {
     let mut said = Vec::new();
-    let taken = restart(host, &mut |line| said.push(line.to_owned()), before);
+    let taken = restart(host, &mut |kind, text| said.push((kind, text.to_owned())), before);
     (taken, said)
 }
 
-fn run(host: &mut Fake) -> (bool, Vec<String>) {
+fn run(host: &mut Fake) -> (bool, Vec<Said>) {
     restart_with(host, &Before::default())
 }
 
@@ -66,8 +67,8 @@ fn it_says_once_that_it_waits_for_the_service_manager_before_it_asks_for_anythin
     let mut host = host();
     host.settles = [Ok(ServiceState::Stopped)].into();
     let (_, said) = run(&mut host);
-    assert_eq!(said.first().map(String::as_str), Some(INTRO), "{said:#?}");
-    assert_eq!(said.iter().filter(|line| line.as_str() == INTRO).count(), 1);
+    assert_eq!(said.first(), Some(&note(INTRO)), "{said:#?}");
+    assert_eq!(said.iter().filter(|(_, line)| line == INTRO).count(), 1);
 }
 
 #[test]
@@ -79,8 +80,8 @@ fn a_stopped_service_is_not_started_and_reads_the_change_when_it_is() {
     assert_eq!(
         said,
         [
-            INTRO,
-            "install: sshd is not running, so it was not started; it reads the change when it is"
+            note(INTRO),
+            warning("sshd is not running, so it was not started; it reads the change when it is")
         ]
     );
     assert_eq!(events(&host), ["settled"]);
@@ -95,9 +96,11 @@ fn a_paused_service_is_left_as_it_is_and_the_advice_is_to_resume_it() {
     assert_eq!(
         said,
         [
-            INTRO,
-            "install: the sshd service is paused, so it was not restarted; resume it (`sc continue sshd`) and run \
-             `ssh-broker install` again"
+            note(INTRO),
+            warning(
+                "the sshd service is paused, so it was not restarted; resume it (`sc continue sshd`) and run \
+                 `ssh-broker install` again"
+            )
         ]
     );
     assert_eq!(
@@ -110,15 +113,18 @@ fn a_paused_service_is_left_as_it_is_and_the_advice_is_to_resume_it() {
 /// What the service manager answers a STOP that sshd's control handler did not answer in time.
 const NO_ANSWER: &str = "The service did not respond to the start or control request in a timely fashion. (1053)";
 
-/// What is said before the wait for an sshd that did not answer the stop, given the service manager's `reply`.
-fn stop_unanswered_line(reply: &str) -> String {
-    format!(
-        "install: sshd did not answer the stop in time ({reply}) and the service manager says it is still running; \
-         install waits, with no time limit, for that sshd to exit, and then starts it. To stop waiting, end the \
-         task ssh-broker-install-sshd (`schtasks /End /TN ssh-broker-install-sshd`, elevated) and run `ssh-broker \
-         install` again; nothing then starts an sshd that exits later. Check sshd at this PC: `sc query sshd`; \
-         start it with `net start sshd` if it is stopped."
-    )
+/// What is said before the wait for an sshd that did not answer the stop, given the service manager's `reply`. A
+/// note: it is of use while the wait lasts, to the person who reads the report the step line names, and nothing
+/// of it is shown afterwards, when the restart went well. Read afterwards it says nothing that sounds like a
+/// failure.
+fn stop_unanswered_line(reply: &str) -> Said {
+    note(format!(
+        "sshd did not answer the stop in time ({reply}) and the service manager says it is still running; \
+         install waits, with no time limit, for that sshd to exit, and then starts it. If the task \
+         ssh-broker-install-sshd is ended during this wait (`schtasks /End /TN ssh-broker-install-sshd`, \
+         elevated), nothing starts an sshd that exits later: check sshd at this PC with `sc query sshd`, start it \
+         with `net start sshd` if it is stopped, and run `ssh-broker install` again."
+    ))
 }
 
 const CAUSE: &str = "the state cannot be read";
@@ -137,7 +143,7 @@ fn after_an_unknown_stop_with(starts: impl Into<std::collections::VecDeque<Start
 }
 
 /// What the run says after a stop whose outcome is not known, with `starts` the answers to its starts.
-fn after_an_unknown_stop<const N: usize>(starts: [StartOutcome; N]) -> String {
+fn after_an_unknown_stop<const N: usize>(starts: [StartOutcome; N]) -> Said {
     let mut host = after_an_unknown_stop_with(starts);
     let (_, said) = run(&mut host);
     said.last().unwrap().clone()
@@ -157,12 +163,14 @@ fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_n
     assert_eq!(
         said,
         [
-            INTRO,
-            "install: the sshd service's state cannot be read (the service manager did not answer), so it was not \
-             restarted; run `ssh-broker install` again to restart it"
+            note(INTRO),
+            warning(
+                "the sshd service's state cannot be read (the service manager did not answer), so it was not \
+                 restarted; run `ssh-broker install` again to restart it"
+            )
         ]
     );
-    for line in &said {
+    for (_, line) in &said {
         assert!(
             !line.contains("running") && !line.contains("accepts") && !line.contains("accept "),
             "a state that was not read is said to be one: {line}"
@@ -199,7 +207,7 @@ fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_n
             unseen: Some("the service manager did not answer".to_owned()),
         }]),
     ];
-    for said in &sentences {
+    for (_, said) in &sentences {
         assert!(
             said.contains(UNSEEN),
             "the cause of the unseen stop is not said: {said}"
@@ -211,42 +219,46 @@ fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_n
     }
     assert_eq!(
         sentences[0],
-        format!(
-            "install: sshd is NOT running: {UNSEEN}; {}, and the service manager refused to start it (Access is \
+        warning(format!(
+            "sshd is NOT running: {UNSEEN}; {}, and the service manager refused to start it (Access is \
              denied. (5)). {NOT_RUNNING_ADVICE}",
             refused_then_stopped_clause("Access is denied. (5)")
-        )
+        ))
     );
     assert_eq!(
         sentences[1],
-        format!("install: {UNSEEN} and a start was accepted; it is paused. Check it at this PC: `sc query sshd`.")
+        warning(format!(
+            "{UNSEEN} and a start was accepted; it is paused. Check it at this PC: `sc query sshd`."
+        ))
     );
     assert_eq!(
         sentences[2],
-        format!(
-            "install: {UNSEEN} and a start was refused (Access is denied. (5)); its state cannot be read (the \
+        warning(format!(
+            "{UNSEEN} and a start was refused (Access is denied. (5)); its state cannot be read (the \
              service manager did not answer). Check it at this PC: `sc query sshd`."
-        )
+        ))
     );
     assert_eq!(
         sentences[3],
-        format!(
-            "install: sshd is running and whether it restarted cannot be told: {UNSEEN}, and a start was refused \
+        warning(format!(
+            "sshd is running and whether it restarted cannot be told: {UNSEEN}, and a start was refused \
              (Access is denied. (5)); `ssh-broker install` restarts it if it has not read the change"
-        )
+        ))
     );
     assert_eq!(
         sentences[4],
-        format!("install: sshd restarted; it accepts {ELEVATION} ({UNSEEN}, and the service manager accepted a start)")
+        note(format!(
+            "sshd restarted; it accepts {ELEVATION} ({UNSEEN}, and the service manager accepted a start)"
+        ))
     );
     assert_eq!(
         sentences[5],
-        format!(
-            "install: sshd is not serving: {UNSEEN}, the service manager refused a start (Access is denied. (5)), \
+        warning(format!(
+            "sshd is not serving: {UNSEEN}, the service manager refused a start (Access is denied. (5)), \
              and the sshd it reported running exited (code 1067) without being seen to listen (whether the \
              service manager had seen it exit could not be read: the service manager did not answer). Check sshd \
              at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped."
-        )
+        ))
     );
 
     // A stop that was not answered in time says so first, and then, its outcome unknown, still never says that
@@ -262,7 +274,7 @@ fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_n
     let (_, said) = run(&mut unanswered);
     assert_eq!(said[1], stop_unanswered_line(NO_ANSWER));
     assert!(
-        said.last().unwrap().contains(UNSEEN) && !said.last().unwrap().contains("was stopped"),
+        said.last().unwrap().1.contains(UNSEEN) && !said.last().unwrap().1.contains("was stopped"),
         "{said:#?}"
     );
 
@@ -271,7 +283,7 @@ fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_n
     unsent.settles = [Ok(ServiceState::Running)].into();
     unsent.stops = [Err(CAUSE.to_owned())].into();
     let (_, said) = run(&mut unsent);
-    let last = said.last().unwrap();
+    let (_, last) = said.last().unwrap();
     assert!(
         last.contains(CAUSE) && last.contains("no stop was sent") && last.contains("last read as running"),
         "{last}"
@@ -302,11 +314,11 @@ fn a_start_after_an_unseen_stop_that_stopped_again_says_the_cause_in_every_sente
     assert!(taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd failed to start once ({UNSEEN}; {}); a second start worked and sshd is running. It \
+        &note(format!(
+            "sshd failed to start once ({UNSEEN}; {}); a second start worked and sshd is running. It \
              accepts {ELEVATION}.",
             stopped_again(1067, 0)
-        )
+        ))
     );
 }
 
@@ -324,10 +336,10 @@ fn a_stop_sshd_did_not_answer_in_time_is_said_before_the_wait_and_the_restart_go
     assert_eq!(
         said,
         [
-            INTRO,
-            &stop_unanswered_line(NO_ANSWER),
-            "install: sshd was stopped; starting sshd",
-            &format!("install: sshd restarted; it accepts {ELEVATION}")
+            note(INTRO),
+            stop_unanswered_line(NO_ANSWER),
+            note("sshd was stopped; starting sshd"),
+            note(format!("sshd restarted; it accepts {ELEVATION}"))
         ]
     );
     assert_eq!(events(&host), ["settled", "stop", "start"]);
@@ -345,7 +357,7 @@ fn a_wait_that_ended_without_a_stop_seen_is_followed_by_a_line_that_says_so_befo
     host.starts = [StartOutcome::Serving(StartReply::Accepted)].into();
     let (_, said) = run(&mut host);
     assert_eq!(said[1], stop_unanswered_line(NO_ANSWER));
-    assert_eq!(said[2], format!("install: {UNSEEN}; starting sshd"));
+    assert_eq!(said[2], note(format!("{UNSEEN}; starting sshd")));
 }
 
 #[test]
@@ -370,11 +382,11 @@ fn a_stop_that_was_not_sent_says_so_with_why_and_that_sshd_was_last_read_as_runn
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: no stop was sent to sshd (cannot open the process of the sshd service), so it was not \
+        &warning(format!(
+            "no stop was sent to sshd (cannot open the process of the sshd service), so it was not \
              restarted. Its state was last read as running, before that, with its earlier configuration, so it \
              does not accept {ELEVATION} yet; run `ssh-broker install` again to restart it"
-        )
+        ))
     );
     assert_eq!(events(&host), ["settled", "stop"]);
 }
@@ -392,10 +404,10 @@ fn a_stop_that_the_service_manager_refused_and_left_sshd_running_starts_nothing(
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd could not be stopped (Access is denied.) and is running with its earlier configuration, \
+        &warning(format!(
+            "sshd could not be stopped (Access is denied.) and is running with its earlier configuration, \
              so it does not accept {ELEVATION} yet; run `ssh-broker install` again to restart it"
-        )
+        ))
     );
     assert_eq!(
         events(&host),
@@ -417,11 +429,11 @@ fn a_stop_the_service_manager_accepted_and_the_service_did_not_take_is_said_so()
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd could not be stopped (the service manager accepted the stop and the service did not stop) \
+        &warning(format!(
+            "sshd could not be stopped (the service manager accepted the stop and the service did not stop) \
              and is running with its earlier configuration, so it does not accept {ELEVATION} yet; run \
              `ssh-broker install` again to restart it"
-        )
+        ))
     );
     assert_eq!(events(&host), ["settled", "stop"]);
 }
@@ -437,10 +449,9 @@ fn a_service_the_stop_left_paused_is_said_to_be_paused_and_nothing_is_started() 
     .into();
     let (taken, said) = run(&mut host);
     assert!(!taken);
+    let (kind, last) = said.last().unwrap();
     assert!(
-        said.last()
-            .unwrap()
-            .contains("and is paused with its earlier configuration"),
+        *kind == LineKind::Warning && last.contains("and is paused with its earlier configuration"),
         "{said:#?}"
     );
     assert_eq!(events(&host), ["settled", "stop"]);
@@ -459,9 +470,9 @@ fn a_stop_whose_result_is_not_known_is_followed_by_one_start_decided_without_a_s
     assert!(taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd restarted; it accepts {ELEVATION} ({UNSEEN}, and the service manager accepted a start)"
-        )
+        &note(format!(
+            "sshd restarted; it accepts {ELEVATION} ({UNSEEN}, and the service manager accepted a start)"
+        ))
     );
     assert_eq!(events(&host), ["settled", "stop", "start"]);
 }
@@ -479,20 +490,20 @@ fn a_start_refused_over_a_running_service_after_an_unknown_stop_does_not_say_it_
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd is running and whether it restarted cannot be told: {UNSEEN}, and a start was refused \
+        &warning(format!(
+            "sshd is running and whether it restarted cannot be told: {UNSEEN}, and a start was refused \
              (the service is already running); `ssh-broker install` restarts it if it has not read the change"
-        )
+        ))
     );
 }
 
 // a refused start after a stop that was not seen =====
 
 /// A run that changed the files, whose stop is not known, answering `starts`; and what `restart` said, with
-/// the starts and the lines in one sequence (a start is "start").
+/// the starts and the lines in one sequence.
 fn unseen_stop_over_changed_files(
     starts: impl Into<std::collections::VecDeque<StartOutcome>>,
-) -> (Fake, bool, Vec<String>) {
+) -> (Fake, bool, Vec<Entry>) {
     let (mut host, before) = changed_by_this_run();
     let log = Rc::new(RefCell::new(Vec::new()));
     host.said_and_started = Some(Rc::clone(&log));
@@ -502,7 +513,11 @@ fn unseen_stop_over_changed_files(
     })]
     .into();
     host.starts = starts.into();
-    let taken = restart(&mut host, &mut |line| log.borrow_mut().push(line.to_owned()), &before);
+    let taken = restart(
+        &mut host,
+        &mut |kind, text| log.borrow_mut().push(Entry::Said((kind, text.to_owned()))),
+        &before,
+    );
     let log = log.borrow().clone();
     (host, taken, log)
 }
@@ -524,22 +539,22 @@ fn a_refused_start_that_reads_stopped_after_an_unseen_stop_is_followed_by_one_st
     ]);
     assert!(taken, "{log:#?}");
     assert_eq!(events(&host), ["settled", "stop", "start", "start"]);
-    let said = format!(
-        "install: {UNSEEN}; {}; starting sshd",
+    let said = Entry::Said(note(format!(
+        "{UNSEEN}; {}; starting sshd",
         refused_then_stopped_clause("An instance of the service is already running. (1056)")
-    );
+    )));
     let said_at = log
         .iter()
-        .position(|line| *line == said)
+        .position(|entry| *entry == said)
         .unwrap_or_else(|| panic!("{log:#?}"));
-    let starts: Vec<usize> = (0..log.len()).filter(|i| log[*i] == "start").collect();
+    let starts: Vec<usize> = (0..log.len()).filter(|i| log[*i] == Entry::Started).collect();
     assert!(
         starts[0] < said_at && said_at < starts[1],
         "the line is said after the first start and before the second: {log:#?}"
     );
     assert_eq!(
         log.last().unwrap(),
-        &format!("install: sshd restarted; it accepts {ELEVATION}")
+        &Entry::Said(note(format!("sshd restarted; it accepts {ELEVATION}")))
     );
     files_were_not_put_back(&host);
 }
@@ -552,15 +567,15 @@ fn a_refused_start_whose_sshd_exited_and_was_seen_after_an_unseen_stop_is_follow
     ]);
     assert!(taken, "{log:#?}");
     assert_eq!(events(&host), ["settled", "stop", "start", "start"]);
-    let said = format!(
-        "install: {UNSEEN}; a start was refused (An instance of the service is already running. (1056)), and the \
+    let said = Entry::Said(note(format!(
+        "{UNSEEN}; a start was refused (An instance of the service is already running. (1056)), and the \
          sshd the service manager reported running exited (code 1067); starting sshd"
-    );
+    )));
     let said_at = log
         .iter()
-        .position(|line| *line == said)
+        .position(|entry| *entry == said)
         .unwrap_or_else(|| panic!("{log:#?}"));
-    let starts: Vec<usize> = (0..log.len()).filter(|i| log[*i] == "start").collect();
+    let starts: Vec<usize> = (0..log.len()).filter(|i| log[*i] == Entry::Started).collect();
     assert!(
         starts[0] < said_at && said_at < starts[1],
         "the line is said after the first start and before the second: {log:#?}"
@@ -584,11 +599,11 @@ fn a_second_refusal_after_an_unseen_stop_says_both_replies_and_starts_nothing_mo
     assert_eq!(events(&host), ["settled", "stop", "start", "start"]);
     assert_eq!(
         log.last().unwrap(),
-        &format!(
-            "install: sshd is NOT running: {UNSEEN}; {}, and the service manager refused to start it (the second \
+        &Entry::Said(warning(format!(
+            "sshd is NOT running: {UNSEEN}; {}, and the service manager refused to start it (the second \
              reply (5)). {NOT_RUNNING_ADVICE}",
             refused_then_stopped_clause("the first reply (1056)")
-        )
+        )))
     );
     files_were_not_put_back(&host);
 }
@@ -616,10 +631,10 @@ fn an_accepted_second_start_that_ended_after_an_unseen_stop(
     assert_eq!(host.drop_in, None, "the drop-in this run made is gone");
     assert_eq!(
         log.last().unwrap(),
-        &format!(
-            "install: sshd failed to start with {ELEVATION} accepted ({UNSEEN}; {refused_clause}; {ended}); the \
+        &Entry::Said(warning(format!(
+            "sshd failed to start with {ELEVATION} accepted ({UNSEEN}; {refused_clause}; {ended}); the \
              original configuration was put back and sshd is running again. It does not accept {ELEVATION}."
-        )
+        )))
     );
 }
 
@@ -673,10 +688,7 @@ fn a_start_accepted_that_serves_is_a_restart() {
     assert!(taken);
     assert_eq!(
         said,
-        [
-            INTRO.to_owned(),
-            format!("install: sshd restarted; it accepts {ELEVATION}")
-        ]
+        [note(INTRO), note(format!("sshd restarted; it accepts {ELEVATION}"))]
     );
     assert_eq!(
         events(&host),
@@ -696,10 +708,10 @@ fn a_start_refused_over_a_service_that_the_service_manager_had_started_again_is_
     assert!(taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd restarted (the service manager had started it again: An instance of the service is \
+        &note(format!(
+            "sshd restarted (the service manager had started it again: An instance of the service is \
              already running.); it accepts {ELEVATION}"
-        )
+        ))
     );
     assert_eq!(events(&host), ["settled", "stop", "start"]);
 }
@@ -718,9 +730,11 @@ fn a_start_refused_that_settles_stopped_puts_nothing_back_because_sshd_never_ran
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        "install: sshd is NOT running: sshd was stopped, and the service manager refused to start it (The service \
-         did not respond to the start or control request in a timely fashion.). Start it at this PC: `net start \
-         sshd`."
+        &warning(
+            "sshd is NOT running: sshd was stopped, and the service manager refused to start it (The service \
+             did not respond to the start or control request in a timely fashion.). Start it at this PC: `net start \
+             sshd`."
+        )
     );
     assert_eq!(
         events(&host),
@@ -745,8 +759,10 @@ fn a_start_after_which_the_state_cannot_be_read_puts_nothing_back_and_says_nothi
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        "install: sshd was stopped and a start was accepted; its state cannot be read (the service manager did not \
-         answer). Check it at this PC: `sc query sshd`."
+        &warning(
+            "sshd was stopped and a start was accepted; its state cannot be read (the service manager did not \
+             answer). Check it at this PC: `sc query sshd`."
+        )
     );
     assert_eq!(
         events(&host),
@@ -765,8 +781,10 @@ fn a_start_after_which_sshd_is_paused_puts_nothing_back() {
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        "install: sshd was stopped and a start was refused (the service is paused); it is paused. Check it at this \
-         PC: `sc query sshd`."
+        &warning(
+            "sshd was stopped and a start was refused (the service is paused); it is paused. Check it at this \
+             PC: `sc query sshd`."
+        )
     );
     assert_eq!(events(&host), ["settled", "stop", "start"]);
 }
@@ -787,7 +805,7 @@ fn exited_before_listening(code: u32) -> String {
 }
 
 /// Everything the flow does after a stop that was seen, for the starts it is given, in order.
-fn after_a_stop_with(starts: impl Into<std::collections::VecDeque<StartOutcome>>) -> (bool, Vec<String>) {
+fn after_a_stop_with(starts: impl Into<std::collections::VecDeque<StartOutcome>>) -> (bool, Vec<Said>) {
     let mut host = after_a_stop();
     host.starts = starts.into();
     run(&mut host)
@@ -799,7 +817,7 @@ fn restarted_is_said_only_after_sshd_listens() {
     assert!(taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!("install: sshd restarted; it accepts {ELEVATION}")
+        &note(format!("sshd restarted; it accepts {ELEVATION}"))
     );
 
     // Whatever else the start comes to, no line says that sshd restarted, and the run is not a success: sshd
@@ -836,7 +854,7 @@ fn restarted_is_said_only_after_sshd_listens() {
         let (taken, said) = after_a_stop_with(starts.clone());
         assert!(!taken, "{starts:?}: {said:#?}");
         assert!(
-            said.iter().all(|line| !line.contains("restarted")),
+            said.iter().all(|(_, line)| !line.contains("restarted")),
             "{starts:?} is said to be a restart: {said:#?}"
         );
     }
@@ -856,11 +874,11 @@ fn an_accepted_start_whose_sshd_exits_before_it_listens_puts_the_files_back() {
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd failed to start with {ELEVATION} accepted ({}); the original configuration was put back \
+        &warning(format!(
+            "sshd failed to start with {ELEVATION} accepted ({}); the original configuration was put back \
              and sshd is running again. It does not accept {ELEVATION}.",
             exited_before_listening(255)
-        )
+        ))
     );
     let events = events(&host);
     let second_start = events.iter().rposition(|event| *event == "start").unwrap();
@@ -884,9 +902,11 @@ fn a_refused_start_whose_sshd_exits_puts_nothing_back() {
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        "install: sshd is not serving: sshd was stopped, the service manager refused a start (Access is denied. \
-         (5)), and the sshd it reported running exited (code 1067) without being seen to listen. Check sshd at \
-         this PC: `sc query sshd`; start it with `net start sshd` if it is stopped."
+        &warning(
+            "sshd is not serving: sshd was stopped, the service manager refused a start (Access is denied. \
+             (5)), and the sshd it reported running exited (code 1067) without being seen to listen. Check sshd at \
+             this PC: `sc query sshd`; start it with `net start sshd` if it is stopped."
+        )
     );
     assert_eq!(
         events(&host),
@@ -914,11 +934,11 @@ fn a_start_after_an_unseen_stop_whose_sshd_exited_says_the_cause_in_every_senten
     assert!(taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd failed to start once ({UNSEEN}; {}); a second start worked and sshd is running. It \
+        &note(format!(
+            "sshd failed to start once ({UNSEEN}; {}); a second start worked and sshd is running. It \
              accepts {ELEVATION}.",
             exited_before_listening(1067)
-        )
+        ))
     );
 }
 
@@ -943,11 +963,11 @@ fn what_this_run_changed_is_put_back_before_the_second_start() {
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd failed to start with {ELEVATION} accepted ({}); the original configuration was put back \
+        &warning(format!(
+            "sshd failed to start with {ELEVATION} accepted ({}); the original configuration was put back \
              and sshd is running again. It does not accept {ELEVATION}.",
             stopped_again(1067, 0)
-        )
+        ))
     );
     let events = events(&host);
     let second_start = events.iter().rposition(|event| *event == "start").unwrap();
@@ -968,19 +988,23 @@ fn the_second_start_is_said_before_it_is_waited_for() {
     host.said_and_started = Some(Rc::clone(&log));
     first_start_fails(&mut host);
     host.starts.push_back(StartOutcome::Serving(StartReply::Accepted));
-    let taken = restart(&mut host, &mut |line| log.borrow_mut().push(line.to_owned()), &before);
+    let taken = restart(
+        &mut host,
+        &mut |kind, text| log.borrow_mut().push(Entry::Said((kind, text.to_owned()))),
+        &before,
+    );
     assert!(!taken);
     let log = log.borrow();
-    let again = format!(
-        "install: sshd failed to start with {ELEVATION} accepted ({}); starting it again (the original configuration \
+    let again = Entry::Said(note(format!(
+        "sshd failed to start with {ELEVATION} accepted ({}); starting it again (the original configuration \
          was put back)",
         stopped_again(1067, 0)
-    );
+    )));
     let said_again = log
         .iter()
-        .position(|line| *line == again)
+        .position(|entry| *entry == again)
         .unwrap_or_else(|| panic!("{log:#?}"));
-    let starts: Vec<usize> = (0..log.len()).filter(|i| log[*i] == "start").collect();
+    let starts: Vec<usize> = (0..log.len()).filter(|i| log[*i] == Entry::Started).collect();
     assert_eq!(starts.len(), 2, "{log:#?}");
     assert!(
         starts[0] < said_again && said_again < starts[1],
@@ -1014,11 +1038,11 @@ fn an_exit_whose_record_could_not_be_read_puts_the_files_back_and_says_why_a_sec
     );
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd is NOT running: it failed to start with {ELEVATION} accepted ({first}), and the service \
+        &warning(format!(
+            "sshd is NOT running: it failed to start with {ELEVATION} accepted ({first}), and the service \
              manager refused a second start (An instance of the service is already running. (1056)). The original \
              configuration was put back. {NOT_RUNNING_ADVICE}"
-        )
+        ))
     );
     assert_eq!(host.config, b"Port 22\r\n", "sshd_config is what it was");
     assert_eq!(host.drop_in, None, "the drop-in this run made is gone");
@@ -1046,11 +1070,11 @@ fn a_second_start_that_works_when_this_run_changed_nothing_says_sshd_accepts_the
     assert!(taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd failed to start once ({}); a second start worked and sshd is running. It accepts \
+        &note(format!(
+            "sshd failed to start once ({}); a second start worked and sshd is running. It accepts \
              {ELEVATION}.",
             stopped_again(1067, 0)
-        )
+        ))
     );
     assert_eq!(
         events(&host),
@@ -1070,13 +1094,13 @@ fn a_second_start_refused_over_a_running_service_says_which_configuration_it_rea
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd failed to start with {ELEVATION} accepted ({}); sshd is running now, but the service \
+        &warning(format!(
+            "sshd failed to start with {ELEVATION} accepted ({}); sshd is running now, but the service \
              manager refused a second start (An instance of the service is already running.), so which \
              configuration it read cannot be told (the original configuration was put back); run `ssh-broker \
              install` again",
             stopped_again(1067, 0)
-        )
+        ))
     );
 }
 
@@ -1092,12 +1116,12 @@ fn a_second_start_refused_that_settles_stopped_says_sshd_is_not_running_and_how_
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd is NOT running: it failed to start with {ELEVATION} accepted ({}), and the service \
+        &warning(format!(
+            "sshd is NOT running: it failed to start with {ELEVATION} accepted ({}), and the service \
              manager refused a second start (Access is denied.). The original configuration was put back. \
              {NOT_RUNNING_ADVICE}",
             stopped_again(1067, 0)
-        )
+        ))
     );
 }
 
@@ -1113,11 +1137,11 @@ fn a_second_start_accepted_that_stops_again_says_both_exit_codes() {
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd is NOT running: it failed to start ({}), and a second start was accepted and sshd \
+        &warning(format!(
+            "sshd is NOT running: it failed to start ({}), and a second start was accepted and sshd \
              stopped again (exit codes 1053 and 7). {NOT_RUNNING_ADVICE}",
             stopped_again(1067, 0)
-        )
+        ))
     );
 }
 
@@ -1130,11 +1154,11 @@ fn a_second_start_accepted_whose_sshd_exits_before_it_listens_says_so() {
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd is NOT running: it failed to start ({}), and a second start was accepted and sshd exited \
+        &warning(format!(
+            "sshd is NOT running: it failed to start ({}), and a second start was accepted and sshd exited \
              (code 3) before it listened. {NOT_RUNNING_ADVICE}",
             stopped_again(1067, 0)
-        )
+        ))
     );
 }
 
@@ -1147,12 +1171,12 @@ fn a_second_start_refused_whose_sshd_exits_is_the_row_of_a_refused_second_start(
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!(
-            "install: sshd is NOT running: it failed to start with {ELEVATION} accepted ({}), and the service \
+        &warning(format!(
+            "sshd is NOT running: it failed to start with {ELEVATION} accepted ({}), and the service \
              manager refused a second start (Access is denied.). The original configuration was put back. \
              {NOT_RUNNING_ADVICE}",
             stopped_again(1067, 0)
-        )
+        ))
     );
 }
 
@@ -1166,9 +1190,10 @@ fn a_second_start_after_which_the_state_cannot_be_read_does_not_say_sshd_is_not_
     });
     let (taken, said) = restart_with(&mut host, &before);
     assert!(!taken);
-    let last = said.last().unwrap();
+    let (kind, last) = said.last().unwrap();
     assert!(
-        last.contains("its state cannot be read (the service manager did not answer)")
+        *kind == LineKind::Warning
+            && last.contains("its state cannot be read (the service manager did not answer)")
             && last.contains("Check it at this PC: `sc query sshd`.")
             && !last.contains("NOT running"),
         "{last}"
@@ -1182,9 +1207,11 @@ fn a_second_start_that_leaves_sshd_paused_says_so() {
     host.starts.push_back(StartOutcome::Paused(StartReply::Accepted));
     let (taken, said) = run(&mut host);
     assert!(!taken);
-    let last = said.last().unwrap();
+    let (kind, last) = said.last().unwrap();
     assert!(
-        last.starts_with("install: sshd is paused:") && last.contains("Check it at this PC: `sc query sshd`."),
+        *kind == LineKind::Warning
+            && last.starts_with("sshd is paused:")
+            && last.contains("Check it at this PC: `sc query sshd`."),
         "{last}"
     );
 }
@@ -1199,7 +1226,7 @@ fn a_file_that_cannot_be_put_back_is_said_and_whether_sshd_read_the_original_is_
     host.starts.push_back(StartOutcome::Serving(StartReply::Accepted));
     let (taken, said) = restart_with(&mut host, &before);
     assert!(!taken);
-    let last = said.last().unwrap();
+    let (_, last) = said.last().unwrap();
     assert!(
         last.contains(&format!(
             "the {DROP_IN_NAME} drop-in could not be put back (remove_drop_in failed)"
@@ -1220,6 +1247,7 @@ fn a_config_that_cannot_be_put_back_leaves_no_candidate_behind() {
     assert!(
         said.last()
             .unwrap()
+            .1
             .contains("sshd_config could not be put back (replace_config failed)"),
         "{said:#?}"
     );

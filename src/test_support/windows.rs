@@ -505,31 +505,16 @@ pub fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
     (log, result)
 }
 
-// Printed texts -----
-
-/// A standard stream that has been closed, as by a dropped SSH connection: every write and flush fails.
-pub struct ClosedStream;
-
-impl std::io::Write for ClosedStream {
-    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-        Err(std::io::ErrorKind::BrokenPipe.into())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Err(std::io::ErrorKind::BrokenPipe.into())
-    }
-}
-
 // The lines of `install` -----
 
 /// What was said, in order, with the stream of each line.
-pub type Said = Vec<(crate::provision::handover::Stream, String)>;
+pub type Said = Vec<(crate::provision::Stream, String)>;
 
 /// A sink for the tests that do not look at what is said.
-pub fn silent(_: crate::provision::handover::Stream, _: &str) {}
+pub fn silent(_: crate::provision::Stream, _: &str) {}
 
 /// A sink that records into `said`.
-pub fn recording(said: &std::cell::RefCell<Said>) -> impl FnMut(crate::provision::handover::Stream, &str) + '_ {
+pub fn recording(said: &std::cell::RefCell<Said>) -> impl FnMut(crate::provision::Stream, &str) + '_ {
     |stream, text| said.borrow_mut().push((stream, text.to_owned()))
 }
 

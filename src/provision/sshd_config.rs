@@ -47,6 +47,17 @@ pub(crate) const CHECK_SSHD: &str =
 /// The variable's name, as the `doctor` row and `sshd -T` know it.
 const VARIABLE: &str = crate::protocol::ElevationPolicy::VARIABLE;
 
+/// What a line of the sshd step is. A warning is a line after which something is not as `install` promises (sshd
+/// does not accept the variable, is not running, was not restarted though it had to be, or the step was not done),
+/// or that tells the person something to do. Every other line is a note, one that says the step could not find
+/// something out and did the safe thing instead (restarted sshd to be sure) among them. How a line is written
+/// to the report and read back is [`sshd_task`](super::sshd_task)'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    Note,
+    Warning,
+}
+
 /// Why a file cannot be edited by [`with_line`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cannot(pub String);

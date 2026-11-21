@@ -1,362 +1,268 @@
-//! Host tests for the order of the hand-over and every sentence of it, over a stand-in for the task and the
-//! report. The real Task Scheduler is measured by `tests/sshd_config_windows.rs`, which CI runs.
+//! Host tests for the report the verb writes and `install` reads. The order of the hand-over is `hand_over_tests`;
+//! the real Task Scheduler is measured by `tests/sshd_config_windows.rs`, which CI runs.
 use super::*;
-use std::cell::RefCell;
-use std::rc::Rc;
 
-const REPORT: &str = r"C:\ProgramData\ssh-broker\install-sshd.log";
-const TASK: &str = "ssh-broker-install-sshd";
-
-/// What happened, in order: the calls on the task as `task: <call>`, the lines said as `said: <line>`.
-type Log = Rc<RefCell<Vec<String>>>;
-
-struct Fake {
-    log: Log,
-    register: Result<(), &'static str>,
-    run: Result<(), &'static str>,
-    wait: Result<WaitOutcome, &'static str>,
-    report: Result<String, &'static str>,
-    remove: Result<(), &'static str>,
-}
-
-impl Fake {
-    fn new(log: &Log) -> Fake {
-        Fake {
-            log: Rc::clone(log),
-            register: Ok(()),
-            run: Ok(()),
-            wait: Ok(WaitOutcome::Ended),
-            report: Ok(complete("install: sshd restarted; it accepts SSH_BROKER_ELEVATION")),
-            remove: Ok(()),
-        }
-    }
-
-    fn call<T: Clone>(&self, name: &str, answer: &Result<T, &'static str>) -> anyhow::Result<T> {
-        self.log.borrow_mut().push(format!("task: {name}"));
-        answer.clone().map_err(|cause| anyhow::anyhow!("{cause}"))
-    }
-}
-
-impl SshdTask for Fake {
-    fn register(&mut self) -> anyhow::Result<()> {
-        self.call("register", &self.register)
-    }
-    fn run(&mut self) -> anyhow::Result<()> {
-        self.call("run", &self.run)
-    }
-    fn wait(&mut self) -> anyhow::Result<WaitOutcome> {
-        self.call("wait", &self.wait)
-    }
-    fn report(&mut self) -> anyhow::Result<String> {
-        self.call("report", &self.report)
-    }
-    fn remove(&mut self) -> anyhow::Result<()> {
-        self.call("remove", &self.remove)
-    }
-}
-
-/// A report text of `lines` (written one per line) that the step closed.
-fn complete(lines: &str) -> String {
-    format!("{}{REPORT_END}\r\n", unclosed(lines))
-}
-
-/// A report text of `lines` (written one per line) with no closing line: the step did not end.
-fn unclosed(lines: &str) -> String {
-    lines.lines().map(|line| format!("{line}\r\n")).collect()
-}
-
-fn run(fake: &mut Fake) -> Log {
-    let log = Rc::clone(&fake.log);
-    hand_over(fake, Path::new(REPORT), &mut |line| {
-        log.borrow_mut().push(format!("said: {line}"))
-    });
-    log
-}
-
-fn new_log() -> Log {
-    Rc::new(RefCell::new(Vec::new()))
-}
-
-fn said(log: &Log) -> Vec<String> {
-    log.borrow()
-        .iter()
-        .filter_map(|entry| entry.strip_prefix("said: ").map(str::to_owned))
-        .collect()
-}
-
-fn calls(log: &Log) -> Vec<String> {
-    log.borrow()
-        .iter()
-        .filter_map(|entry| entry.strip_prefix("task: ").map(str::to_owned))
-        .collect()
-}
-
-const HANDED_OVER: &str = "install: sshd's configuration is set up by the task ssh-broker-install-sshd, which runs as SYSTEM and \
-     finishes even if this install is ended; what it does follows when it has finished, and can be read while it \
-     runs in C:\\ProgramData\\ssh-broker\\install-sshd.log";
-
-/// What is said of a report that has no closing line, which says both things it can mean.
-const NO_CLOSING_LINE: &str = "install: the report of the task ssh-broker-install-sshd has no closing line: the task was \
-     ended before its step finished, or a line of the report could not be written; what it had said follows. Check \
-     sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.";
-
-// the order =====
+// what a line of the report is =====
 
 #[test]
-fn the_task_is_registered_run_waited_for_read_and_removed_in_that_order_and_its_lines_are_printed() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.report = Ok(complete(
-        "install: a first line\ninstall: sshd restarted; it accepts SSH_BROKER_ELEVATION",
-    ));
-    let log = run(&mut fake);
+fn a_warning_is_told_from_a_note_by_its_prefix_in_the_report() {
+    assert_eq!(WARNING_PREFIX, "warning: ");
+    assert_eq!(render(LineKind::Note, "sshd restarted"), "sshd restarted");
     assert_eq!(
-        *log.borrow(),
+        render(LineKind::Warning, "sshd is NOT running"),
+        "warning: sshd is NOT running"
+    );
+}
+
+#[test]
+fn every_line_of_a_warning_that_has_several_is_a_warning_in_the_report() {
+    assert_eq!(
+        render(LineKind::Warning, "sshd rejects it: line 1\nline 2"),
+        "warning: sshd rejects it: line 1\nwarning: line 2"
+    );
+    assert_eq!(render(LineKind::Note, "line 1\nline 2"), "line 1\nline 2");
+}
+
+#[test]
+fn an_empty_text_is_rendered_as_one_empty_line_of_its_kind() {
+    assert_eq!(render(LineKind::Note, ""), "");
+    assert_eq!(render(LineKind::Warning, ""), "warning: ");
+}
+
+/// A note whose line begins with the prefix gets one more space in front, which `read_line` takes off: the
+/// line cannot be read as a warning, and renders in the report as a plain line.
+#[test]
+fn a_note_that_begins_like_a_warning_is_rendered_with_one_space_more_and_read_line_takes_it_off() {
+    assert_eq!(render(LineKind::Note, "warning: x"), " warning: x");
+    assert_eq!(render(LineKind::Note, " warning: x"), "  warning: x");
+    assert_eq!(render(LineKind::Note, "a\nwarning: b"), "a\n warning: b");
+    for text in ["warning: x", " warning: x", "warning: ", "plain", "  indented", ""] {
+        assert_eq!(
+            read_line(&render(LineKind::Note, text)),
+            (LineKind::Note, text),
+            "{text:?}"
+        );
+        assert_eq!(
+            read_line(&render(LineKind::Warning, text)),
+            (LineKind::Warning, text),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_reported_text_is_read_as_its_lines_and_their_kinds() {
+    let parsed = Report::parse("a note\r\nwarning: a warning\r\nanother note\r\n");
+    assert_eq!(
+        parsed.lines,
         [
-            "task: register",
-            "task: run",
-            &format!("said: {HANDED_OVER}"),
-            "task: wait",
-            "task: report",
-            "said: install: a first line",
-            "said: install: sshd restarted; it accepts SSH_BROKER_ELEVATION",
-            "task: remove",
+            ReportLine {
+                kind: LineKind::Note,
+                text: "a note".into()
+            },
+            ReportLine {
+                kind: LineKind::Warning,
+                text: "a warning".into()
+            },
+            ReportLine {
+                kind: LineKind::Note,
+                text: "another note".into()
+            },
         ]
     );
-}
-
-#[test]
-fn the_hand_over_is_said_after_the_task_runs_and_before_anything_waits_for_it() {
-    // A stop of `install` that comes after this line leaves the task running to its end: the line is what a
-    // caller that ends `install` waits for.
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    let log = run(&mut fake);
-    let log = log.borrow();
-    let at = |entry: &str| log.iter().position(|e| e == entry).unwrap();
-    assert!(at("task: run") < at(&format!("said: {HANDED_OVER}")));
-    assert!(at(&format!("said: {HANDED_OVER}")) < at("task: wait"));
-}
-
-#[test]
-fn the_hand_over_names_the_report_it_is_given() {
-    assert_eq!(
-        handed_over_line(Path::new(r"D:\x\install-sshd.log")),
-        "install: sshd's configuration is set up by the task ssh-broker-install-sshd, which runs as SYSTEM and \
-         finishes even if this install is ended; what it does follows when it has finished, and can be read while \
-         it runs in D:\\x\\install-sshd.log"
-    );
-    assert!(HANDED_OVER.starts_with(HANDED_OVER_PREFIX));
-}
-
-// the report says itself that it is whole =====
-
-#[test]
-fn a_report_that_ends_with_the_closing_line_is_complete_and_the_closing_line_is_not_printed() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.report = Ok(complete("install: a first line\ninstall: a second line"));
-    let log = run(&mut fake);
-    assert_eq!(said(&log)[1..], ["install: a first line", "install: a second line"]);
-    assert!(
-        said(&log).iter().all(|line| line != REPORT_END),
-        "the closing line is for the reader, not for the person"
-    );
-    assert_eq!(calls(&log).last().unwrap(), "remove");
-
-    let parsed = Report::parse(&complete("a\nb"));
-    assert!(parsed.complete);
-    assert_eq!(parsed.lines, ["a", "b"]);
-}
-
-#[test]
-fn a_report_without_the_closing_line_is_said_to_be_incomplete_before_what_it_had_said() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.report = Ok(unclosed("install: sshd is running with its earlier configuration"));
-    let log = run(&mut fake);
-    assert_eq!(
-        said(&log)[1..],
-        [
-            NO_CLOSING_LINE,
-            "install: sshd is running with its earlier configuration",
-        ]
-    );
-    assert_eq!(calls(&log), ["register", "run", "wait", "report", "remove"]);
-
-    let parsed = Report::parse(&unclosed("a\nb"));
-    assert!(!parsed.complete);
-    assert_eq!(parsed.lines, ["a", "b"]);
-}
-
-#[test]
-fn an_incomplete_report_with_no_line_says_the_task_had_said_nothing() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.report = Ok(String::new());
-    let log = run(&mut fake);
-    assert_eq!(
-        said(&log)[1..],
-        [
-            NO_CLOSING_LINE,
-            "install: the task ssh-broker-install-sshd had said nothing",
-        ]
-    );
-    assert_eq!(calls(&log), ["register", "run", "wait", "report", "remove"]);
-}
-
-#[test]
-fn a_closing_line_with_nothing_before_it_is_a_step_that_had_nothing_to_change() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.report = Ok(complete(""));
-    let log = run(&mut fake);
-    assert_eq!(
-        said(&log)[1..],
-        ["install: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change"]
-    );
-    assert_eq!(calls(&log).last().unwrap(), "remove");
-}
-
-#[test]
-fn a_reported_text_is_read_as_its_lines() {
-    assert_eq!(Report::parse("a\r\nb\r\n").lines, ["a", "b"]);
-    assert_eq!(Report::parse("a\nb").lines, ["a", "b"]);
+    assert_eq!(parsed.warnings().collect::<Vec<_>>(), ["a warning"]);
+    assert_eq!(Report::parse("a\nb").lines.len(), 2);
     assert!(Report::parse("").lines.is_empty());
     assert!(!Report::parse("").complete);
 }
 
-// what goes wrong =====
+#[test]
+fn a_line_that_is_written_is_read_back_as_it_was_said() {
+    let said = [
+        (LineKind::Note, "sshd restarted; it accepts SSH_BROKER_ELEVATION"),
+        (LineKind::Warning, "sshd is NOT running: start it"),
+        (LineKind::Warning, "line 1\nline 2"),
+    ];
+    let mut out = Vec::new();
+    write_lines(&mut out, |say| {
+        for (kind, text) in said {
+            say(kind, text);
+        }
+    })
+    .unwrap();
+    let parsed = Report::parse(&String::from_utf8(out).unwrap());
+    assert!(parsed.complete);
+    assert_eq!(
+        parsed.warnings().collect::<Vec<_>>(),
+        ["sshd is NOT running: start it", "line 1", "line 2"]
+    );
+    assert_eq!(parsed.lines.len(), 4);
+    assert_eq!(parsed.lines[0].kind, LineKind::Note);
+}
+
+/// What `Report::parse` reads of `said` after the verb has written it: every line with its kind and text.
+fn written_and_read(said: &[(LineKind, &str)]) -> Vec<(LineKind, String)> {
+    let mut out = Vec::new();
+    write_lines(&mut out, |say| {
+        for (kind, text) in said {
+            say(*kind, text);
+        }
+    })
+    .unwrap();
+    let parsed = Report::parse(&String::from_utf8(out).unwrap());
+    assert!(parsed.complete);
+    parsed.lines.into_iter().map(|line| (line.kind, line.text)).collect()
+}
+
+/// A note that begins with the warning's prefix is written so that `parse` reads it back as a note, and as the text
+/// it was: it cannot become a warning, which `install` would show.
+#[test]
+fn a_note_that_begins_with_the_warning_prefix_is_read_back_as_that_note() {
+    for text in [
+        "warning: this is a note",
+        " warning: one space is a space of the note",
+        "  warning: two",
+        "warning: ",
+    ] {
+        assert_eq!(
+            written_and_read(&[(LineKind::Note, text)]),
+            [(LineKind::Note, text.to_owned())],
+            "{text:?}"
+        );
+    }
+}
+
+/// A note that is the closing line, with nothing after it (the process ended there), must not make the report
+/// read as complete.
+#[test]
+fn a_note_that_is_the_closing_line_does_not_complete_a_report_that_ends_after_it() {
+    let parsed = Report::parse(&format!("{}\r\n", render(LineKind::Note, REPORT_END)));
+    assert!(!parsed.complete);
+    assert_eq!(
+        parsed.lines,
+        [ReportLine {
+            kind: LineKind::Note,
+            text: REPORT_END.into()
+        }]
+    );
+}
 
 #[test]
-fn a_task_that_cannot_be_registered_is_said_to_have_changed_nothing_and_nothing_is_run() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.register = Err("access denied");
-    let log = run(&mut fake);
+fn a_note_that_is_the_closing_line_is_read_back_as_that_note_in_a_whole_report() {
     assert_eq!(
-        said(&log),
+        written_and_read(&[(LineKind::Note, REPORT_END)]),
+        [(LineKind::Note, REPORT_END.to_owned())]
+    );
+    let spaced = format!(" {REPORT_END}");
+    assert_eq!(
+        written_and_read(&[(LineKind::Note, &spaced)]),
+        [(LineKind::Note, spaced.clone())]
+    );
+}
+
+#[test]
+fn a_note_of_several_lines_one_of_which_is_the_closing_line_stays_a_note() {
+    let text = format!("first\n{REPORT_END}\nthird");
+    assert_eq!(
+        written_and_read(&[(LineKind::Note, &text)]),
         [
-            "install: sshd was not set up to accept SSH_BROKER_ELEVATION: the task ssh-broker-install-sshd could not \
-             be registered: access denied. Nothing of sshd's was changed; `ssh-broker elevate` works without it."
+            (LineKind::Note, "first".to_owned()),
+            (LineKind::Note, REPORT_END.to_owned()),
+            (LineKind::Note, "third".to_owned()),
         ]
     );
-    assert_eq!(
-        calls(&log),
-        ["register"],
-        "nothing was run, and there is nothing to remove"
-    );
+    let parsed = Report::parse(&format!("first\r\n{}\r\n", render(LineKind::Note, REPORT_END)));
+    assert!(!parsed.complete);
+    assert_eq!(parsed.lines.len(), 2);
 }
 
 #[test]
-fn a_task_that_cannot_be_started_is_said_so_and_removed() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.run = Err("the task is disabled");
-    let log = run(&mut fake);
+fn a_note_of_several_lines_one_of_which_begins_with_the_warning_prefix_stays_a_note() {
     assert_eq!(
-        said(&log),
+        written_and_read(&[(LineKind::Note, "first\nwarning: second\nthird")]),
         [
-            "install: sshd was not set up to accept SSH_BROKER_ELEVATION: the task ssh-broker-install-sshd could not \
-             be started: the task is disabled. Nothing of sshd's was changed; `ssh-broker elevate` works without it."
+            (LineKind::Note, "first".to_owned()),
+            (LineKind::Note, "warning: second".to_owned()),
+            (LineKind::Note, "third".to_owned()),
         ]
     );
-    assert_eq!(calls(&log), ["register", "run", "remove"]);
 }
 
 #[test]
-fn a_task_that_cannot_be_started_and_cannot_be_removed_says_both() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.run = Err("the task is disabled");
-    fake.remove = Err("access denied");
-    let log = run(&mut fake);
-    let said = said(&log);
-    assert_eq!(said.len(), 2, "{said:#?}");
+fn a_warning_whose_text_begins_like_a_warning_is_one_warning_with_that_text() {
     assert_eq!(
-        said[1],
-        "install: the task ssh-broker-install-sshd could not be removed (access denied); it has no trigger, runs \
-         nothing by itself, and the next install replaces it"
+        written_and_read(&[
+            (LineKind::Warning, "warning: twice"),
+            (LineKind::Warning, " warning: spaced")
+        ]),
+        [
+            (LineKind::Warning, "warning: twice".to_owned()),
+            (LineKind::Warning, " warning: spaced".to_owned()),
+        ]
     );
 }
 
+/// An empty text is one empty line of its kind, as every line was written before kinds.
 #[test]
-fn a_missing_report_is_said_and_the_task_is_still_removed() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.report = Err("the system cannot find the file specified");
-    let log = run(&mut fake);
+fn an_empty_text_is_one_empty_line_of_its_kind() {
     assert_eq!(
-        said(&log).last().unwrap(),
-        &format!(
-            "install: the report of the task ssh-broker-install-sshd could not be read in {REPORT} (the system cannot \
-             find the file specified); if it is not there, the task did not start or could not create it. Whether \
-             sshd accepts SSH_BROKER_ELEVATION and is running is not known: `ssh-broker doctor` says, and `sc query \
-             sshd` shows whether sshd runs"
-        )
-    );
-    assert_eq!(calls(&log), ["register", "run", "wait", "report", "remove"]);
-}
-
-#[test]
-fn a_task_that_cannot_be_removed_is_said_so_after_its_report() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.remove = Err("access denied");
-    let log = run(&mut fake);
-    let said = said(&log);
-    assert_eq!(
-        said[said.len() - 2],
-        "install: sshd restarted; it accepts SSH_BROKER_ELEVATION",
-        "the report's last line stays the line before"
-    );
-    assert_eq!(
-        said.last().unwrap(),
-        "install: the task ssh-broker-install-sshd could not be removed (access denied); it has no trigger, runs \
-         nothing by itself, and the next install replaces it"
+        written_and_read(&[(LineKind::Note, ""), (LineKind::Warning, "")]),
+        [(LineKind::Note, String::new()), (LineKind::Warning, String::new())]
     );
 }
 
 #[test]
-fn an_instance_that_was_listed_and_never_launched_is_taken_as_proof_of_nothing() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.wait = Ok(WaitOutcome::NeverLaunched { count: 1 });
-    let log = run(&mut fake);
+fn a_text_with_crlf_line_breaks_is_read_back_as_its_lines_with_their_kinds() {
     assert_eq!(
-        said(&log).last().unwrap(),
-        &format!(
-            "install: the Task Scheduler lists an instance of the task {TASK} that it has not started; it may still \
-             run, and nothing is known of what it does. Its report is {REPORT}. End and remove the task (`schtasks \
-             /End /TN {TASK}`, then `schtasks /Delete /TN {TASK} /F`, elevated) when it is not wanted; if the step \
-             has started meanwhile, ending it can leave sshd stopped. Check sshd at this PC: `sc query sshd`; start \
-             it with `net start sshd` if it is stopped."
-        )
-    );
-    assert_eq!(
-        calls(&log),
-        ["register", "run", "wait"],
-        "the report is not read, and the task that may still run is not removed"
+        written_and_read(&[
+            (LineKind::Note, "first\r\nwarning: second\r\n"),
+            (LineKind::Warning, "one\r\ntwo"),
+        ]),
+        [
+            (LineKind::Note, "first".to_owned()),
+            (LineKind::Note, "warning: second".to_owned()),
+            (LineKind::Warning, "one".to_owned()),
+            (LineKind::Warning, "two".to_owned()),
+        ]
     );
 }
 
 #[test]
-fn a_wait_that_fails_leaves_the_task_and_says_it_may_still_run() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.wait = Err("the Task Scheduler did not answer");
-    let log = run(&mut fake);
+fn a_report_that_ends_with_the_closing_line_is_complete_and_the_closing_line_is_not_a_line() {
+    let parsed = Report::parse(&format!("a\r\nb\r\n{REPORT_END}\r\n"));
+    assert!(parsed.complete);
     assert_eq!(
-        said(&log).last().unwrap(),
-        &format!(
-            "install: waiting for the task {TASK} failed (the Task Scheduler did not answer); it may still run. Its \
-             report is {REPORT}"
-        )
+        parsed.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+        ["a", "b"]
     );
-    assert_eq!(calls(&log), ["register", "run", "wait"]);
+
+    let parsed = Report::parse("a\r\nb\r\n");
+    assert!(!parsed.complete);
+    assert_eq!(parsed.lines.len(), 2);
 }
 
-// the report =====
+// the report file =====
+
+#[test]
+fn the_report_file_holds_notes_and_warnings_as_plain_lines() {
+    let dir = std::env::temp_dir().join(format!("sb-report-plain-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("install-sshd.log");
+
+    write_report(&path, |say| {
+        say(LineKind::Note, "restarting sshd");
+        say(LineKind::Warning, "sshd is NOT running");
+        say(LineKind::Note, "sshd restarted");
+    })
+    .unwrap();
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        raw,
+        format!("restarting sshd\r\nwarning: sshd is NOT running\r\nsshd restarted\r\n{REPORT_END}\r\n")
+    );
+}
 
 #[test]
 fn the_verb_writes_each_line_to_the_report_whole_before_it_goes_on() {
@@ -367,9 +273,9 @@ fn the_verb_writes_each_line_to_the_report_whole_before_it_goes_on() {
 
     let mut seen_by_a_reader = Vec::new();
     write_report(&path, |say| {
-        say("install: first");
+        say(LineKind::Note, "first");
         seen_by_a_reader.push(std::fs::read_to_string(&path).unwrap());
-        say("install: second");
+        say(LineKind::Warning, "second");
         seen_by_a_reader.push(std::fs::read_to_string(&path).unwrap());
     })
     .unwrap();
@@ -377,7 +283,7 @@ fn the_verb_writes_each_line_to_the_report_whole_before_it_goes_on() {
 
     assert_eq!(
         seen_by_a_reader,
-        ["install: first\r\n", "install: first\r\ninstall: second\r\n"],
+        ["first\r\n", "first\r\nwarning: second\r\n"],
         "a line is in the file when `say` returns, and the earlier run's text is gone"
     );
 }
@@ -390,7 +296,7 @@ fn the_closing_line_is_written_only_after_the_step_has_returned() {
 
     let mut inside = None;
     write_report(&path, |say| {
-        say("install: first");
+        say(LineKind::Warning, "first");
         inside = Some(Report::parse(&std::fs::read_to_string(&path).unwrap()));
     })
     .unwrap();
@@ -403,12 +309,12 @@ fn the_closing_line_is_written_only_after_the_step_has_returned() {
         !inside.complete,
         "while the step runs the file does not say that it is whole"
     );
-    assert_eq!(inside.lines, ["install: first"]);
+    assert_eq!(inside.warnings().collect::<Vec<_>>(), ["first"]);
     assert!(after.complete);
-    assert_eq!(after.lines, ["install: first"]);
+    assert_eq!(after.warnings().collect::<Vec<_>>(), ["first"]);
     assert_eq!(
         raw,
-        format!("install: first\r\n{REPORT_END}\r\n"),
+        format!("warning: first\r\n{REPORT_END}\r\n"),
         "the last line of the file"
     );
 }
@@ -442,9 +348,9 @@ fn a_line_that_cannot_be_written_leaves_the_report_without_a_closing_line_and_is
     };
     let mut said = Vec::new();
     let err = write_lines(&mut out, |say| {
-        say("install: first");
-        say("install: second");
-        say("install: third");
+        say(LineKind::Note, "first");
+        say(LineKind::Warning, "second");
+        say(LineKind::Note, "third");
         said.push("the step ran to its end");
     })
     .unwrap_err();
@@ -456,8 +362,51 @@ fn a_line_that_cannot_be_written_leaves_the_report_without_a_closing_line_and_is
     );
     assert_eq!(
         String::from_utf8(out.written).unwrap(),
-        "install: first\r\n",
+        "first\r\n",
         "no closing line follows a failed one: the report says it is not whole"
+    );
+}
+
+/// A writer whose `fails_at`th write (counting from 0) fails and that accepts every other.
+struct FailsOnce {
+    fails_at: usize,
+    writes: usize,
+    written: Vec<u8>,
+}
+
+impl std::io::Write for FailsOnce {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writes += 1;
+        if self.writes - 1 == self.fails_at {
+            return Err(std::io::Error::other("the disk hiccuped"));
+        }
+        self.written.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn nothing_is_written_after_a_line_that_could_not_be_written() {
+    let mut out = FailsOnce {
+        fails_at: 1,
+        writes: 0,
+        written: Vec::new(),
+    };
+    let err = write_lines(&mut out, |say| {
+        say(LineKind::Note, "first");
+        say(LineKind::Note, "second\nof two lines");
+        say(LineKind::Note, "third");
+    })
+    .unwrap_err();
+    assert_eq!(err.to_string(), "the disk hiccuped");
+    assert_eq!(
+        String::from_utf8(out.written).unwrap(),
+        "first\r\n",
+        "a later line would follow a hole, and no closing line either"
     );
 }
 
@@ -467,7 +416,7 @@ fn a_closing_line_that_cannot_be_written_is_the_error() {
         accepts: 1,
         written: Vec::new(),
     };
-    let err = write_lines(&mut out, |say| say("install: first")).unwrap_err();
+    let err = write_lines(&mut out, |say| say(LineKind::Note, "first")).unwrap_err();
     assert_eq!(err.to_string(), "the disk is full");
     let text = String::from_utf8(out.written).unwrap();
     assert!(!text.contains(REPORT_END), "{text}");

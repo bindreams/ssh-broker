@@ -3,29 +3,28 @@
 
 use anyhow::Context;
 
-use super::handover::{Say, Stream};
 use super::path_env;
 use super::procwait::{self, StillRunning, Survivor};
 use super::schtasks::{INSTALL_SSHD_TASK, WaitOutcome, end_and_remove_install_sshd_task};
 use super::sessions::Targets;
 use super::sshd_config::CHECK_SSHD;
+use super::{Say, Stream};
 
 /// Run `install`: say that it starts, run `body` (everything up to the sshd step, which gives back what must be
-/// held until the end, the lock), run `sshd_step` with a sink for its lines, then say that ssh-broker has been
-/// installed. The sshd step never fails `install`, so the last line is said exactly when `body` succeeded, and
-/// nothing is said after it.
+/// held until the end, the lock), then `sshd_step`. The sshd step never fails `install`, so the line that says it
+/// is installed is said exactly when `body` succeeded, and nothing is said after it.
 pub fn install_run<T>(
     say: &mut Say<'_>,
     version: &str,
     body: impl FnOnce(&mut Say<'_>) -> anyhow::Result<T>,
-    sshd_step: impl FnOnce(&T, &mut dyn FnMut(&str)),
+    sshd_step: impl FnOnce(&T, &mut Say<'_>),
 ) -> anyhow::Result<()> {
     say(
         Stream::Out,
         &format!("Installing ssh-broker v{version} for every user of this PC..."),
     );
     let held = body(say)?;
-    sshd_step(&held, &mut |line| say(Stream::Out, line));
+    sshd_step(&held, say);
     say(Stream::Out, &super::installed_line(version));
     Ok(())
 }

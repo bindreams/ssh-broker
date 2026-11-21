@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::{SshdTask, hand_over};
+use crate::provision::Say;
 use crate::provision::layout::Layout;
 use crate::provision::procwait::Role;
 use crate::provision::schtasks::{INSTALL_SSHD_TASK, WaitOutcome, install_sshd_task_xml};
@@ -59,7 +60,7 @@ impl SshdTask for SystemTask<'_> {
 
 /// Hand `install`'s sshd step to the task that runs `exe` (the installed one), and say what it did on `say`.
 /// See [`hand_over`].
-pub fn hand_over_sshd_step(layout: &Layout, exe: &Path, say: &mut dyn FnMut(&str)) {
+pub fn hand_over_sshd_step(layout: &Layout, exe: &Path, say: &mut Say<'_>) {
     let report = layout.install_sshd_report_path();
-    hand_over(&mut SystemTask { exe, report: &report }, &report, say);
+    hand_over(&mut SystemTask { exe, report: &report }, &report, exe, say);
 }

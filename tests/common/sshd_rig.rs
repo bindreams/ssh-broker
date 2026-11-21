@@ -172,7 +172,7 @@ pub fn accept_elevation_variable() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let mut said = Vec::new();
-        configure_this_machine(&mut |line| said.push(line.to_owned()));
+        configure_this_machine(&mut |kind, text| said.push(ssh_broker::provision::sshd_task::render(kind, text)));
         match sshd_reading_this_machine() {
             Ok(SshdReading::Read {
                 listing,

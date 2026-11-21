@@ -41,6 +41,30 @@ pub mod taskscheduler;
 #[cfg(windows)]
 pub(crate) mod user_rows;
 
+/// Where a line goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    Out,
+    Err,
+}
+
+/// `install`'s line sink; a failed write loses the line ([`say_to`]). The two value notices (`Handover::printed`
+/// and `ShownValue::print` in `handover`) do not use it.
+pub type Say<'a> = dyn FnMut(Stream, &str) + 'a;
+
+/// A closed stdout (`install` run over an SSH connection that has gone) must not panic, as `println!` would.
+pub fn say_to(out: &mut impl std::io::Write, err: &mut impl std::io::Write, stream: Stream, text: &str) {
+    let _ = match stream {
+        Stream::Out => writeln!(out, "{text}"),
+        Stream::Err => writeln!(err, "{text}"),
+    };
+}
+
+/// The [`Say`] `install` uses.
+pub fn say_to_console(stream: Stream, text: &str) {
+    say_to(&mut std::io::stdout(), &mut std::io::stderr(), stream, text);
+}
+
 /// `install` subcommand: idempotently assert all desired state. Windows-only.
 pub fn install() -> anyhow::Result<()> {
     #[cfg(windows)]
@@ -173,11 +197,10 @@ mod provision_tests;
 
 #[cfg(windows)]
 mod imp {
-    use super::handover::{
-        Handover, Say, Stream, hand_over, remove_arguments, replace_shell, say_to_console, show_to_console,
-    };
+    use super::handover::{Handover, hand_over, remove_arguments, replace_shell, show_to_console};
     use super::layout::{self, Layout};
     use super::registry::SshdShell;
+    use super::{Say, Stream, say_to_console};
     use super::{
         flow, install_lock, path_env, probe, probe_run, procwait, registry, report, schtasks, session_rows,
         session_task, sessions, sshd_config, sshd_task, system_config, taskscheduler, user_rows,
@@ -209,7 +232,7 @@ mod imp {
         //    the agents start again afterwards, even if a later step fails, except in a session
         //    whose old agent has not exited.
         let current = std::env::current_exe().context("current_exe")?;
-        // All of install's lines go through `handover::Say`; the two value notices do not (see its docs). The last
+        // All of install's lines go through `provision::Say`; the two value notices do not (see its docs). The last
         // line follows the sshd step.
         flow::install_run(
             &mut say_to_console,

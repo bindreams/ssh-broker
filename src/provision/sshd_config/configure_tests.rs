@@ -67,7 +67,14 @@ pub(crate) struct Fake {
     pub(crate) fail_once_started: Option<&'static str>,
     /// A log a test shares with its `say` closure: `start()` writes "start" to it, so the lines said and the
     /// starts made come out in one sequence.
-    pub(crate) said_and_started: Option<Rc<RefCell<Vec<String>>>>,
+    pub(crate) said_and_started: Option<Rc<RefCell<Vec<Entry>>>>,
+}
+
+/// One entry of the log that `said_and_started` shares: a line said, or a start made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Entry {
+    Said(Said),
+    Started,
 }
 
 impl Fake {
@@ -219,7 +226,7 @@ impl SshdHost for Fake {
         self.call("start");
         self.event("start");
         if let Some(log) = &self.said_and_started {
-            log.borrow_mut().push("start".to_owned());
+            log.borrow_mut().push(Entry::Started);
         }
         self.starts
             .pop_front()
@@ -343,10 +350,21 @@ impl SshdHost for Fake {
     }
 }
 
+/// A line the step said, as the tests collect it: its kind and its text.
+pub(crate) type Said = (LineKind, String);
+
+pub(crate) fn note(text: impl Into<String>) -> Said {
+    (LineKind::Note, text.into())
+}
+
+pub(crate) fn warning(text: impl Into<String>) -> Said {
+    (LineKind::Warning, text.into())
+}
+
 /// Run the flow and return what it said with its result.
-fn run(host: &mut Fake) -> (bool, Vec<String>) {
+fn run(host: &mut Fake) -> (bool, Vec<Said>) {
     let mut said = Vec::new();
-    let accepted = configure(host, &mut |line| said.push(line.to_owned()));
+    let accepted = configure(host, &mut |kind, text| said.push((kind, text.to_owned())));
     (accepted, said)
 }
 
@@ -358,52 +376,52 @@ fn position(events: &[String], name: &str) -> usize {
 }
 
 /// What `install` says to do by hand.
-fn advice() -> String {
-    format!(
-        "install: add `{ACCEPT_LINE}` above the first `Match` in sshd_config, then run `ssh-broker install` again, \
+fn advice() -> Said {
+    warning(format!(
+        "add `{ACCEPT_LINE}` above the first `Match` in sshd_config, then run `ssh-broker install` again, \
          which restarts sshd; `ssh-broker elevate` works without it"
-    )
+    ))
 }
 
 /// Why `install` restarts sshd: a variable in force that the running sshd was started too early to have read.
 fn unread(file: &str) -> String {
-    format!("install: sshd was started before {file} was last changed, so it has not read it")
+    format!("sshd was started before {file} was last changed, so it has not read it")
 }
 
-const NOT_RUNNING: &str = "install: sshd is not running; it reads the change when it starts";
+const NOT_RUNNING: &str = "sshd is not running; it reads the change when it starts";
 
-const RESTARTING: &str = "install: restarting sshd; install waits for the service manager at each step, and after a start \
-                          for sshd to listen or exit";
-const RESTARTED: &str = "install: sshd restarted; it accepts SSH_BROKER_ELEVATION";
+const RESTARTING: &str = "restarting sshd; install waits for the service manager at each step, and after a start for \
+                          sshd to listen or exit";
+const RESTARTED: &str = "sshd restarted; it accepts SSH_BROKER_ELEVATION";
 
 /// What the machine does to the service when `install` restarts sshd and nothing goes wrong.
 const RESTART: [&str; 3] = ["settled", "stop", "start"];
 
 /// What `install` says when it restarts sshd for `why` and nothing goes wrong.
-fn restarted_for(why: String) -> [String; 3] {
-    [why, RESTARTING.to_owned(), RESTARTED.to_owned()]
+fn restarted_for(why: String) -> [Said; 3] {
+    [note(why), note(RESTARTING), note(RESTARTED)]
 }
 
 fn drop_in_file() -> String {
     Fake::folder().join(DROP_IN_NAME).display().to_string()
 }
 
-fn said_advice(said: &[String]) -> bool {
+fn said_advice(said: &[Said]) -> bool {
     said.contains(&advice())
 }
 
 /// What `install` says when it cannot ask sshd for its configuration.
-fn ask_failed(cause: &str, left: &str) -> String {
-    format!(
-        "install: could not ask sshd for its configuration ({cause}), so {left}. To have sshd accept \
+fn ask_failed(cause: &str, left: &str) -> Said {
+    warning(format!(
+        "could not ask sshd for its configuration ({cause}), so {left}. To have sshd accept \
          SSH_BROKER_ELEVATION, add `{ACCEPT_LINE}` above the first `Match` in sshd_config and restart sshd; \
          `ssh-broker elevate` works without it."
-    )
+    ))
 }
 
 /// No sentence of the step tells anyone to remove a file or a folder.
-fn assert_nothing_to_remove(said: &[String]) {
-    for line in said {
+fn assert_nothing_to_remove(said: &[Said]) {
+    for (_, line) in said {
         assert!(
             !line.to_ascii_lowercase().contains("remove") && !line.contains("Inspect it"),
             "{line}"
@@ -434,12 +452,12 @@ fn a_service_with_arguments_changes_nothing_and_says_where_to_add_the_line() {
     assert!(!accepted);
     assert_eq!(
         said,
-        [format!(
-            "install: the sshd service runs with arguments (`-f D:\\conf\\sshd_config`), which can name another \
+        [warning(format!(
+            "the sshd service runs with arguments (`-f D:\\conf\\sshd_config`), which can name another \
              configuration file, so nothing of sshd's was changed. To have sshd accept SSH_BROKER_ELEVATION, add \
              `{ACCEPT_LINE}` above the first `Match` in the file it reads and restart sshd; `ssh-broker elevate` \
              works without it."
-        )]
+        ))]
     );
     // Nothing of sshd's was read or changed: the check is the only call.
     assert_eq!(*host.calls.borrow(), ["service_arguments"]);
@@ -512,14 +530,14 @@ fn a_service_that_is_not_running_reads_what_is_there_when_it_starts() {
     let (accepted, said) = run(&mut host);
     assert!(accepted, "{said:?}");
     assert!(host.events.is_empty(), "{:?}", host.events);
-    assert_eq!(said, [NOT_RUNNING]);
+    assert_eq!(said, [warning(NOT_RUNNING)]);
 
     // Whatever the time of a file.
     let mut host = Fake::configured().stopped();
     host.config_time = host.clock + 1000;
     let (accepted, said) = run(&mut host);
     assert!(accepted, "{said:?}");
-    assert_eq!(said, [NOT_RUNNING]);
+    assert_eq!(said, [warning(NOT_RUNNING)]);
 }
 
 #[test]
@@ -537,8 +555,8 @@ fn a_file_written_in_the_tick_sshd_started_in_is_judged_unread() {
 fn a_file_whose_time_is_ahead_of_the_clock_cannot_be_judged_and_sshd_is_restarted_each_time() {
     let mut host = Fake::configured();
     host.config_time = host.clock + 1000;
-    let why = "install: sshd_config's change time is ahead of this machine's clock, so it cannot be told whether \
-               sshd has read it"
+    let why = "sshd_config's change time is ahead of this machine's clock, so it cannot be told whether sshd has \
+               read it"
         .to_owned();
     for _ in 0..2 {
         host.restarts_cleanly();
@@ -557,8 +575,7 @@ fn a_file_whose_time_is_ahead_of_the_clock_cannot_be_judged_and_sshd_is_restarte
     assert_eq!(
         said,
         restarted_for(format!(
-            "install: {}'s change time is ahead of this machine's clock, so it cannot be told whether sshd has \
-             read it",
+            "{}'s change time is ahead of this machine's clock, so it cannot be told whether sshd has read it",
             Fake::folder().display()
         ))
     );
@@ -574,9 +591,10 @@ fn a_time_that_cannot_be_read_says_so() {
         assert!(!accepted, "{method}");
         assert!(host.events.is_empty(), "{method}: {:?}", host.events);
         assert_eq!(said.len(), 1, "{method}: {said:?}");
-        let line = &said[0];
+        let (kind, line) = &said[0];
+        assert_eq!(*kind, LineKind::Warning, "{method}");
         assert!(
-            line.starts_with("install: cannot tell whether sshd has read its configuration (")
+            line.starts_with("cannot tell whether sshd has read its configuration (")
                 && line.contains(&format!("{method} failed"))
                 && line.ends_with("); restart the sshd service for it to accept SSH_BROKER_ELEVATION"),
             "{method}: {said:?}"
@@ -586,10 +604,10 @@ fn a_time_that_cannot_be_read_says_so() {
 
 // every file sshd reads =====
 
-/// What `install` says of an `Include` of another location in `file`.
+/// What `install` says of an `Include` of another location in `file`: a note, as sshd is restarted to be sure.
 fn includes_other(file: &str, line: &str) -> String {
     format!(
-        "install: {file} has `{line}`; files sshd includes from elsewhere are not judged, so it cannot be told \
+        "{file} has `{line}`; files sshd includes from elsewhere are not judged, so it cannot be told \
          whether sshd has read its configuration, and it is restarted to be sure it accepts SSH_BROKER_ELEVATION"
     )
 }
@@ -649,7 +667,7 @@ fn an_include_of_another_location_cannot_be_told() {
     host.folder_time = Some(1);
     let (accepted, said) = run(&mut host);
     assert!(accepted, "{said:?}");
-    assert_eq!(said, [NOT_RUNNING]);
+    assert_eq!(said, [warning(NOT_RUNNING)]);
 }
 
 #[test]
@@ -761,7 +779,8 @@ fn a_candidate_sshd_rejects_leaves_the_original_byte_for_byte_and_says_which_lin
     assert!(host.candidate.is_none(), "the candidate is removed: {:?}", host.events);
     assert!(said_advice(&said), "{said:?}");
     assert!(
-        said.iter().any(|line| line.contains("Bad configuration option")),
+        said.iter()
+            .any(|(kind, line)| *kind == LineKind::Warning && line.contains("Bad configuration option")),
         "{said:?}"
     );
     assert_nothing_to_remove(&said);
@@ -788,7 +807,11 @@ fn a_config_that_cannot_be_edited_safely_is_left_and_says_which_line_to_add() {
     assert!(!accepted);
     assert_eq!(host.config, before);
     assert!(said_advice(&said), "{said:?}");
-    assert!(said.iter().any(|line| line.contains("UTF-16")), "{said:?}");
+    assert!(
+        said.iter()
+            .any(|(kind, line)| *kind == LineKind::Warning && line.contains("UTF-16")),
+        "{said:?}"
+    );
     assert!(!host.events.iter().any(|e| e == "write candidate"));
 }
 
@@ -831,9 +854,9 @@ fn a_question_to_sshd_about_the_candidate_that_fails_leaves_the_original_and_rem
         host.events
     );
     assert!(
-        said.contains(
-            &"install: sshd_config was not changed: cannot ask sshd about the edited copy: sshd_t failed".to_owned()
-        ),
+        said.contains(&warning(
+            "sshd_config was not changed: cannot ask sshd about the edited copy: sshd_t failed"
+        )),
         "{said:?}"
     );
     assert!(said_advice(&said), "{said:?}");
@@ -854,7 +877,7 @@ fn a_candidate_that_fails_to_write_is_removed() {
     );
     assert!(
         said.iter()
-            .any(|line| line.contains("cannot write a candidate beside it")),
+            .any(|(kind, line)| *kind == LineKind::Warning && line.contains("cannot write a candidate beside it")),
         "{said:?}"
     );
 }
@@ -881,8 +904,8 @@ fn a_drop_in_folder_that_is_not_administrator_only_gets_the_acceptenv_line_in_ss
     host.restarts_cleanly();
     let (accepted, said) = run(&mut host);
     assert!(accepted, "{said:?}");
-    assert_eq!(said[said.len() - 3], unread("sshd_config"));
-    assert_eq!(said.last().unwrap(), RESTARTED);
+    assert_eq!(said[said.len() - 3], note(unread("sshd_config")));
+    assert_eq!(said.last().unwrap(), &note(RESTARTED));
     assert_eq!(host.config, with_line(STOCK.as_bytes(), ACCEPT_LINE).unwrap());
     assert_eq!(host.drop_in, None);
     assert_eq!(host.drop_in_writes, 0);
@@ -892,11 +915,11 @@ fn a_drop_in_folder_that_is_not_administrator_only_gets_the_acceptenv_line_in_ss
         host.calls
     );
     assert!(
-        said.contains(&format!(
-            "install: {} is left as it is (its ACL is not the hardened one); SSH_BROKER_ELEVATION is accepted by a \
+        said.contains(&note(format!(
+            "{} is left as it is (its ACL is not the hardened one); SSH_BROKER_ELEVATION is accepted by a \
              line in sshd_config instead",
             Fake::folder().display()
-        )),
+        ))),
         "{said:?}"
     );
     // Through the same candidate, checks and rename.
@@ -912,19 +935,19 @@ fn a_drop_in_folder_that_cannot_be_made_is_said_not_to_be_made_and_the_line_goes
     host.restarts_cleanly();
     let (accepted, said) = run(&mut host);
     assert!(accepted, "{said:?}");
-    assert_eq!(said[said.len() - 3], unread("sshd_config"));
+    assert_eq!(said[said.len() - 3], note(unread("sshd_config")));
     assert_eq!(host.config, with_line(STOCK.as_bytes(), ACCEPT_LINE).unwrap());
     assert_eq!(host.drop_in, None);
     assert!(
-        said.contains(&format!(
-            "install: {} could not be made (Access is denied); SSH_BROKER_ELEVATION is accepted by a line in \
+        said.contains(&note(format!(
+            "{} could not be made (Access is denied); SSH_BROKER_ELEVATION is accepted by a line in \
              sshd_config instead",
             Fake::folder().display()
-        )),
+        ))),
         "{said:?}"
     );
     assert!(
-        said.iter().all(|line| !line.contains("is left as it is")),
+        said.iter().all(|(_, line)| !line.contains("is left as it is")),
         "a folder that is not there is not left as it is: {said:?}"
     );
 }
@@ -937,7 +960,7 @@ fn a_drop_in_that_cannot_be_read_or_written_is_left_and_the_line_goes_into_sshd_
         host.restarts_cleanly();
         let (accepted, said) = run(&mut host);
         assert!(accepted, "{method}: {said:?}");
-        assert_eq!(said[said.len() - 3], unread("sshd_config"), "{method}");
+        assert_eq!(said[said.len() - 3], note(unread("sshd_config")), "{method}");
         assert_eq!(
             host.config,
             with_line(STOCK.as_bytes(), ACCEPT_LINE).unwrap(),
@@ -945,8 +968,9 @@ fn a_drop_in_that_cannot_be_read_or_written_is_left_and_the_line_goes_into_sshd_
         );
         assert_eq!(host.drop_in, None, "{method}");
         assert!(
-            said.iter()
-                .any(|line| line.contains("is left as it is") && line.contains(&format!("{method} failed"))),
+            said.iter().any(|(kind, line)| *kind == LineKind::Note
+                && line.contains("is left as it is")
+                && line.contains(&format!("{method} failed"))),
             "{method}: {said:?}"
         );
         assert_nothing_to_remove(&said);
@@ -962,7 +986,10 @@ fn when_the_acceptenv_line_cannot_go_into_sshd_config_either_the_advice_is_to_ad
     assert!(!accepted);
     assert_eq!(host.config, STOCK.as_bytes());
     assert!(said_advice(&said), "{said:?}");
-    assert!(!said.iter().any(|line| line.contains("accepted by a line")), "{said:?}");
+    assert!(
+        !said.iter().any(|(_, line)| line.contains("accepted by a line")),
+        "{said:?}"
+    );
     assert_nothing_to_remove(&said);
 }
 
@@ -973,7 +1000,7 @@ fn a_change_made_while_sshd_is_not_running_is_read_when_it_starts() {
     let mut host = Fake::with_config(STOCK).stopped();
     let (accepted, said) = run(&mut host);
     assert!(accepted, "{said:?}");
-    assert_eq!(said, [NOT_RUNNING]);
+    assert_eq!(said, [warning(NOT_RUNNING)]);
     assert_eq!(host.config, with_line(STOCK.as_bytes(), INCLUDE_LINE).unwrap());
     assert_eq!(host.drop_in.as_deref(), Some(drop_in_text().as_bytes()));
 }
@@ -1059,10 +1086,9 @@ fn a_change_made_in_this_run_that_sshd_cannot_start_with_is_put_back_through_the
     assert!(!accepted, "{said:?}");
     assert_eq!(host.config, STOCK.as_bytes(), "sshd_config is what it was");
     assert_eq!(host.drop_in, None, "the drop-in this run made is gone");
+    let (kind, last) = said.last().unwrap();
     assert!(
-        said.last()
-            .unwrap()
-            .starts_with("install: sshd failed to start with SSH_BROKER_ELEVATION accepted ("),
+        *kind == LineKind::Warning && last.starts_with("sshd failed to start with SSH_BROKER_ELEVATION accepted ("),
         "{said:?}"
     );
     let order = |name: &str| position(&host.events, name);
@@ -1077,11 +1103,13 @@ fn a_change_made_in_this_run_is_restarted_for_even_when_the_time_of_the_start_ca
     host.fail = Some("service_started");
     let (accepted, said) = run(&mut host);
     assert!(accepted, "{said:?}");
-    assert_eq!(said[said.len() - 2], RESTARTING);
-    assert_eq!(said.last().unwrap(), RESTARTED);
+    assert_eq!(said[said.len() - 2], note(RESTARTING));
+    assert_eq!(said.last().unwrap(), &note(RESTARTED));
+    let (kind, why) = &said[said.len() - 3];
     assert!(
-        said[said.len() - 3].starts_with("install: cannot tell whether sshd has read its configuration (")
-            && said[said.len() - 3].ends_with("); this run changed it, so it has not"),
+        *kind == LineKind::Note
+            && why.starts_with("cannot tell whether sshd has read its configuration (")
+            && why.ends_with("); this run changed it, so it has not"),
         "{said:?}"
     );
 }

@@ -26,6 +26,39 @@ fn the_installed_line_is_the_literal() {
     assert_eq!(installed_line("0.2.0"), "ssh-broker v0.2.0 has been installed!");
 }
 
+// The sink for `install`'s lines =====
+
+use crate::test_support::ClosedStream;
+
+/// A line to a stream that cannot be written (an `install` over an SSH connection that has gone) is lost, on
+/// either stream, and the lines that can be written go to the stream they name.
+#[test]
+fn a_line_to_a_closed_stream_is_lost_without_a_panic_and_the_others_are_written() {
+    say_to(&mut ClosedStream, &mut ClosedStream, Stream::Out, "a line");
+    say_to(&mut ClosedStream, &mut ClosedStream, Stream::Err, "a line");
+
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    say_to(&mut out, &mut err, Stream::Out, "to stdout");
+    say_to(&mut out, &mut err, Stream::Err, "to stderr");
+    assert_eq!((out, err), (b"to stdout\n".to_vec(), b"to stderr\n".to_vec()));
+
+    // Stdout closed, stderr open: the stdout line is lost and the stderr lines are written.
+    let mut err = Vec::new();
+    say_to(&mut ClosedStream, &mut err, Stream::Out, "lost");
+    say_to(&mut ClosedStream, &mut err, Stream::Err, "first");
+    say_to(&mut ClosedStream, &mut err, Stream::Out, "lost again");
+    say_to(&mut ClosedStream, &mut err, Stream::Err, "second");
+    assert_eq!(err, b"first\nsecond\n");
+
+    // Stderr closed, stdout open: the stderr line is lost and the stdout lines are written.
+    let mut out = Vec::new();
+    say_to(&mut out, &mut ClosedStream, Stream::Err, "lost");
+    say_to(&mut out, &mut ClosedStream, Stream::Out, "first");
+    say_to(&mut out, &mut ClosedStream, Stream::Err, "lost again");
+    say_to(&mut out, &mut ClosedStream, Stream::Out, "second");
+    assert_eq!(out, b"first\nsecond\n");
+}
+
 // The shell config row and the probe =====
 
 use crate::shell::test_host::{TestHost, USER_CONFIG};

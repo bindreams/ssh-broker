@@ -6,155 +6,82 @@
 //! [`schtasks::INSTALL_SSHD_TASK`], which runs the hidden verb `install-sshd` as SYSTEM, starts it, and waits for
 //! it. A service starts the task's process, outside the session's job, and it runs the step to its end
 //! whatever happens to `install`. The verb writes what the step says to a report, a line at a time, and `install`
-//! prints the report once the task's instances have ended.
+//! shows the warnings of the report once the task's instances have ended; the notes stay in the report, unless
+//! the report has no closing line, and then `install` shows it whole.
 //!
-//! The order and the sentences are here, over [`SshdTask`], which tests stand in for; [`system`] is the Task
-//! Scheduler behind it. No failure here fails `install`: the variable is a convenience.
+//! The report's line format lives here: [`render`] and [`Report::parse`] are inverses, and a warning's line begins
+//! with [`WARNING_PREFIX`]. [`super::sshd_config`] owns [`LineKind`] and does not depend on this module.
 
 use std::path::Path;
 
 use anyhow::Context;
 
-use super::schtasks::{INSTALL_SSHD_TASK, WaitOutcome, end_and_remove_install_sshd_task};
-use super::sshd_config::CHECK_SSHD;
+use super::sshd_config::LineKind;
 
+mod hand_over;
 #[cfg(windows)]
 mod system;
+pub use hand_over::{HANDED_OVER_PREFIX, SshdTask, hand_over, step_line};
 #[cfg(windows)]
 pub use system::{hand_over_sshd_step, report_path};
 
-/// What the hand-over needs of the Task Scheduler and the report.
-pub trait SshdTask {
-    /// Register the task, replacing a copy an earlier `install` left behind, and clear the report of an earlier
-    /// run.
-    fn register(&mut self) -> anyhow::Result<()>;
-    /// Start the task and return without waiting for it.
-    fn run(&mut self) -> anyhow::Result<()>;
-    /// Wait, with no bound, for the processes of the task's instances to exit.
-    fn wait(&mut self) -> anyhow::Result<WaitOutcome>;
-    /// The report the verb wrote.
-    fn report(&mut self) -> anyhow::Result<String>;
-    /// Delete the task.
-    fn remove(&mut self) -> anyhow::Result<()>;
+/// The last line of a report whose step ended; its absence means the step did not finish. [`render`] never
+/// produces it for a line of the step.
+pub const REPORT_END: &str = "the step has ended; this report is complete";
+
+/// The beginning of a warning's line in the report.
+pub const WARNING_PREFIX: &str = "warning: ";
+
+/// Whether a note's `line`, after any spaces, begins with [`WARNING_PREFIX`] or is [`REPORT_END`]: it would read as
+/// a warning or as the closing line, so [`render`] puts one space in front of it.
+fn reads_as_the_reports_own(line: &str) -> bool {
+    let line = line.trim_start_matches(' ');
+    line.starts_with(WARNING_PREFIX) || line == REPORT_END
 }
 
-/// Prefix of the line that says the step was handed over; a caller that ends `install` once the step is the task's
-/// waits for it.
-pub const HANDED_OVER_PREFIX: &str = "install: sshd's configuration is set up by the task ssh-broker-install-sshd";
-
-/// The line that says the step is the task's, that what it does is printed when it has finished, and where it
-/// can be read while it runs.
-pub fn handed_over_line(report: &Path) -> String {
-    format!(
-        "{HANDED_OVER_PREFIX}, which runs as SYSTEM and finishes even if this install is ended; what it does \
-         follows when it has finished, and can be read while it runs in {}",
-        report.display()
-    )
+/// The report's text for a line of `kind` that says `text`: one report line for each line of `text` (one empty line
+/// for an empty text), each warning line with [`WARNING_PREFIX`]. A note line that [`reads_as_the_reports_own`]
+/// gets one more space in front, which [`read_line`] takes off: a note never reads as a warning, and no line of
+/// the step reads as the closing line.
+pub fn render(kind: LineKind, text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        lines.push("");
+    }
+    lines
+        .into_iter()
+        .map(|line| match kind {
+            LineKind::Warning => format!("{WARNING_PREFIX}{line}"),
+            LineKind::Note if reads_as_the_reports_own(line) => format!(" {line}"),
+            LineKind::Note => line.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// Hand the sshd step to the task, wait for it, and say what it reported, on `say`.
-///
-/// The hand-over line is said before the wait, so an `install` ended from there on leaves the step to the task.
-/// When the instances have ended, the report is printed and the task removed. The report is believed to be whole
-/// only when it says so itself ([`REPORT_END`] is its last line); one that does not is printed as far as it goes,
-/// with both of its readings: the task's process ended before the step did, or a line could not be written. A
-/// wait that cannot say the instances ended leaves the task registered and the report unread, and says that the
-/// step may still run: nothing is concluded from it. No failure fails `install`.
-pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&str)) {
-    if let Err(e) = task.register() {
-        say(&not_set_up("registered", &e));
-        return;
-    }
-    if let Err(e) = task.run() {
-        say(&not_set_up("started", &e));
-        remove(task, say);
-        return;
-    }
-    say(&handed_over_line(report));
-
-    match task.wait() {
-        Ok(WaitOutcome::Ended) => {}
-        Ok(WaitOutcome::NeverLaunched { .. }) => {
-            say(&format!(
-                "install: the Task Scheduler lists an instance of the task {INSTALL_SSHD_TASK} that it has not \
-                 started; it may still run, and nothing is known of what it does. Its report is {}. End and remove \
-                 the task {} when it is not wanted; if the step has started meanwhile, ending it can leave sshd \
-                 stopped. {CHECK_SSHD}",
-                report.display(),
-                end_and_remove_install_sshd_task()
-            ));
-            return;
-        }
-        Err(e) => {
-            say(&format!(
-                "install: waiting for the task {INSTALL_SSHD_TASK} failed ({e:#}); it may still run. Its report is {}",
-                report.display()
-            ));
-            return;
-        }
-    }
-
-    // The report says itself that it is whole: a process that ends before the step does (a panic, an
-    // administrator ending the task) leaves it without its closing line.
-    match task.report() {
-        Ok(text) => {
-            let Report { lines, complete } = Report::parse(&text);
-            if complete {
-                if lines.is_empty() {
-                    say(
-                        "install: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change",
-                    );
-                }
-            } else {
-                say(&format!(
-                    "install: the report of the task {INSTALL_SSHD_TASK} has no closing line: the task was ended before \
-                     its step finished, or a line of the report could not be written; what it had said follows. \
-                     {CHECK_SSHD}"
-                ));
-                if lines.is_empty() {
-                    say(&format!("install: the task {INSTALL_SSHD_TASK} had said nothing"));
-                }
-            }
-            for line in lines {
-                say(&line);
-            }
-        }
-        Err(e) => say(&format!(
-            "install: the report of the task {INSTALL_SSHD_TASK} could not be read in {} ({e:#}); if it is not there, \
-             the task did not start or could not create it. Whether sshd accepts SSH_BROKER_ELEVATION and is \
-             running is not known: `ssh-broker doctor` says, and `sc query sshd` shows whether sshd runs",
-            report.display()
-        )),
-    }
-    remove(task, say);
-}
-
-fn not_set_up(did_not: &str, cause: &anyhow::Error) -> String {
-    format!(
-        "install: sshd was not set up to accept {}: the task {INSTALL_SSHD_TASK} could not be {did_not}: {cause:#}. \
-         Nothing of sshd's was changed; `ssh-broker elevate` works without it.",
-        crate::protocol::ElevationPolicy::VARIABLE
-    )
-}
-
-fn remove(task: &mut dyn SshdTask, say: &mut dyn FnMut(&str)) {
-    if let Err(e) = task.remove() {
-        say(&format!(
-            "install: the task {INSTALL_SSHD_TASK} could not be removed ({e:#}); it has no trigger, runs nothing by \
-             itself, and the next install replaces it"
-        ));
+/// The kind and the text of one line of a report, the inverse of [`render`] for one line.
+fn read_line(line: &str) -> (LineKind, &str) {
+    if let Some(text) = line.strip_prefix(WARNING_PREFIX) {
+        (LineKind::Warning, text)
+    } else if line.starts_with(' ') && reads_as_the_reports_own(line) {
+        (LineKind::Note, &line[1..])
+    } else {
+        (LineKind::Note, line)
     }
 }
 
-/// The last line of a report whose step ended: the report says itself that it is whole, so that nothing has to
-/// be read of the Task Scheduler to know.
-pub const REPORT_END: &str = "install-sshd: the step has ended; this report is complete";
+/// One line of a report: what the step said, and what kind of line it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportLine {
+    pub kind: LineKind,
+    pub text: String,
+}
 
 /// A report text read: the lines the step said, and whether the step ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     /// What the step said, without the closing line.
-    pub lines: Vec<String>,
+    pub lines: Vec<ReportLine>,
     /// The last line is [`REPORT_END`]: the step ended and said everything it had to.
     pub complete: bool,
 }
@@ -162,12 +89,32 @@ pub struct Report {
 impl Report {
     /// The lines of `text`, and whether the last of them is [`REPORT_END`] (that line is not in `lines`).
     pub fn parse(text: &str) -> Report {
-        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
-        let complete = lines.last().is_some_and(|last| last == REPORT_END);
+        let mut lines: Vec<&str> = text.lines().collect();
+        let complete = lines.last().is_some_and(|last| *last == REPORT_END);
         if complete {
             lines.pop();
         }
-        Report { lines, complete }
+        Report {
+            lines: lines
+                .into_iter()
+                .map(|line| {
+                    let (kind, text) = read_line(line);
+                    ReportLine {
+                        kind,
+                        text: text.to_owned(),
+                    }
+                })
+                .collect(),
+            complete,
+        }
+    }
+
+    /// The warnings, in the order they were said.
+    pub fn warnings(&self) -> impl Iterator<Item = &str> {
+        self.lines
+            .iter()
+            .filter(|line| line.kind == LineKind::Warning)
+            .map(|line| line.text.as_str())
     }
 }
 
@@ -182,18 +129,25 @@ fn append(out: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
 /// is in the file when `say` returns. When `step` has returned and every line was written, [`REPORT_END`] is
 /// appended: a report that is missing a line never closes. Without a report to write to nothing is run: its
 /// words would be lost, and the `install` that waits for the task would find none.
-pub fn write_report(path: &Path, step: impl FnOnce(&mut dyn FnMut(&str))) -> anyhow::Result<()> {
+pub fn write_report(path: &Path, step: impl FnOnce(&mut dyn FnMut(LineKind, &str))) -> anyhow::Result<()> {
     let mut file = std::fs::File::create(path).with_context(|| format!("empty the report {}", path.display()))?;
     write_lines(&mut file, step).with_context(|| format!("write the report {}", path.display()))
 }
 
 /// [`write_report`] over a writer that is already open: the first line that cannot be written is the error, and
-/// no closing line follows it.
-fn write_lines(out: &mut impl std::io::Write, step: impl FnOnce(&mut dyn FnMut(&str))) -> std::io::Result<()> {
+/// nothing is written after it (a failed write may have left half a line), the closing line included.
+fn write_lines(
+    out: &mut impl std::io::Write,
+    step: impl FnOnce(&mut dyn FnMut(LineKind, &str)),
+) -> std::io::Result<()> {
     let mut failure = None;
-    step(&mut |line| {
-        if let Err(e) = append(out, line) {
-            failure.get_or_insert(e);
+    step(&mut |kind, text| {
+        for line in render(kind, text).split('\n') {
+            if failure.is_none()
+                && let Err(e) = append(out, line)
+            {
+                failure = Some(e);
+            }
         }
     });
     match failure {
