@@ -117,8 +117,8 @@ pub fn replace_shell<T>(
 /// file, and is called only for a [`Decision::Write`]), or print what is not carried.
 /// `config` is the config's path. A previous shell with nothing to carry ([`system_config::nothing_to_carry`]) is known
 /// from `previous` alone, whatever `decision` says; a decision that claims it for any other shell is
-/// printed, not believed. What is printed goes through `show`, which does not return when the write fails (see
-/// [`show_to`]).
+/// printed, not believed. What is printed goes through `show`, which must not return when the write fails: the
+/// caller passes [`show_to_console`] (see [`show_to`]).
 pub fn hand_over(
     config: &Path,
     previous: &SshdShell,
@@ -148,8 +148,8 @@ pub fn hand_over(
 /// for what is read and left). `config` is the config's path and `key` the registry key. The text with the
 /// value is emitted first and `remove`, which takes the [`ShownValue`] that makes, runs after it; a failed
 /// removal is said with its cause and leaves the value for the next `install`, and one that worked says nothing.
-/// The text with the value goes through `show`, which does not return when the write fails (see [`show_to`]); the
-/// other lines go through `say`.
+/// The text with the value goes through `show`, which must not return when the write fails: the caller passes
+/// [`show_to_console`] (see [`show_to`]). The other lines go through `say`.
 pub fn remove_arguments(
     config: &Path,
     key: &str,

@@ -38,7 +38,7 @@ fn block() -> ShellBlock {
 }
 
 /// Run `hand_over` for `previous` and return the notices it showed.
-fn said_for(
+fn shown_for(
     previous: &SshdShell,
     decision: Decision,
     create: impl FnOnce(&ShellBlock) -> anyhow::Result<CreateOutcome>,
@@ -51,8 +51,8 @@ fn said_for(
 }
 
 /// Run `hand_over` for the foreign `previous()` and return the notices it showed.
-fn said(decision: Decision, create: impl FnOnce(&ShellBlock) -> anyhow::Result<CreateOutcome>) -> Vec<String> {
-    said_for(&previous(), decision, create)
+fn shown(decision: Decision, create: impl FnOnce(&ShellBlock) -> anyhow::Result<CreateOutcome>) -> Vec<String> {
+    shown_for(&previous(), decision, create)
 }
 
 fn holds_every_previous_value(text: &str) {
@@ -80,7 +80,7 @@ fn before_the_flip(text: &str) {
 
 #[test]
 fn a_config_created_by_someone_else_in_between_prints_the_previous_values() {
-    let notices = said(Decision::Write(block()), |_| Ok(CreateOutcome::FileExists));
+    let notices = shown(Decision::Write(block()), |_| Ok(CreateOutcome::FileExists));
     assert_eq!(notices.len(), 1, "{notices:?}");
     holds_every_previous_value(&notices[0]);
     assert!(notices[0].contains(&format!("{CONFIG} exists")), "{}", notices[0]);
@@ -89,16 +89,16 @@ fn a_config_created_by_someone_else_in_between_prints_the_previous_values() {
 /// The config is the record of what was carried; stdout carries only `install`'s step lines and its last line.
 #[test]
 fn a_written_config_says_nothing() {
-    let notices = said(Decision::Write(block()), |_| Ok(CreateOutcome::Created));
+    let notices = shown(Decision::Write(block()), |_| Ok(CreateOutcome::Created));
     assert_eq!(notices, Vec::<String>::new());
 }
 
 /// No notice begins with the verb's name, and what `remove_arguments` says rather than shows is on stderr.
 #[test]
 fn no_notice_begins_with_the_verb_and_what_is_said_is_on_stderr() {
-    let mut texts = said(Decision::Write(block()), |_| Err(anyhow::anyhow!("disk full")));
-    texts.extend(said(Decision::Write(block()), |_| Ok(CreateOutcome::FileExists)));
-    texts.extend(said(Decision::Skip(Skip::NotAFile), |_| unreachable!()));
+    let mut texts = shown(Decision::Write(block()), |_| Err(anyhow::anyhow!("disk full")));
+    texts.extend(shown(Decision::Write(block()), |_| Ok(CreateOutcome::FileExists)));
+    texts.extend(shown(Decision::Skip(Skip::NotAFile), |_| unreachable!()));
     for (read, config_is_file, remove_fails) in [
         (Ok(Some("-NoLogo")), Ok(ConfigKind::File), true),
         (Ok(Some("-NoLogo")), Ok(ConfigKind::Missing), false),
@@ -152,7 +152,7 @@ fn a_notice_that_cannot_be_written_does_not_return() {
 
 #[test]
 fn a_config_that_cannot_be_written_prints_the_previous_values_and_the_cause() {
-    let notices = said(Decision::Write(block()), |_| Err(anyhow::anyhow!("disk full")));
+    let notices = shown(Decision::Write(block()), |_| Err(anyhow::anyhow!("disk full")));
     assert_eq!(notices.len(), 1, "{notices:?}");
     holds_every_previous_value(&notices[0]);
     assert!(notices[0].contains("could not write"), "{}", notices[0]);
@@ -168,7 +168,7 @@ fn every_skip_that_loses_the_previous_shell_prints_the_previous_values_without_c
         Skip::Unchecked("cannot tell whether the config exists".into()),
     ] {
         let created = Cell::new(false);
-        let notices = said(Decision::Skip(skip.clone()), |_| {
+        let notices = shown(Decision::Skip(skip.clone()), |_| {
             created.set(true);
             Ok(CreateOutcome::Created)
         });
@@ -190,7 +190,7 @@ fn a_config_path_that_is_not_a_file_prints_that_and_the_previous_values_without_
         &|_| false,
     );
     let created = Cell::new(false);
-    let notices = said(decision, |_| {
+    let notices = shown(decision, |_| {
         created.set(true);
         Ok(CreateOutcome::Created)
     });
@@ -207,7 +207,7 @@ fn a_config_path_that_is_not_a_file_prints_that_and_the_previous_values_without_
 /// The path turned into a non-file between the check and the create: the create says so and the line is the same.
 #[test]
 fn a_config_path_that_turns_into_a_non_file_before_the_create_prints_that() {
-    let notices = said(Decision::Write(block()), |_| Ok(CreateOutcome::NotAFile));
+    let notices = shown(Decision::Write(block()), |_| Ok(CreateOutcome::NotAFile));
     assert_eq!(notices.len(), 1, "{notices:?}");
     holds_every_previous_value(&notices[0]);
     assert!(notices[0].contains("is not a file"), "{}", notices[0]);
@@ -233,7 +233,7 @@ fn a_previous_shell_that_is_ssh_broker_or_unset_says_nothing_whatever_the_decisi
             Decision::Write(block()),
         ] {
             let created = Cell::new(false);
-            let notices = said_for(&own(shell), decision, |_| {
+            let notices = shown_for(&own(shell), decision, |_| {
                 created.set(true);
                 Ok(CreateOutcome::Created)
             });
@@ -246,7 +246,7 @@ fn a_previous_shell_that_is_ssh_broker_or_unset_says_nothing_whatever_the_decisi
 /// are printed.
 #[test]
 fn a_nothing_to_carry_skip_for_a_foreign_shell_prints_the_previous_values() {
-    let notices = said(Decision::Skip(Skip::NothingToCarry), |_| Ok(CreateOutcome::Created));
+    let notices = shown(Decision::Skip(Skip::NothingToCarry), |_| Ok(CreateOutcome::Created));
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains(PWSH7), "{}", notices[0]);
 }

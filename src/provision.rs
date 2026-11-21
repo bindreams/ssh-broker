@@ -203,7 +203,7 @@ mod imp {
         //    first, so a planted one is never adopted. A different build over an installed one stops
         //    every agent first (they hold the exe open) and waits for them to exit, with the logon
         //    task and the auto-login tasks disabled so that nothing starts one from the old exe
-        //    meanwhile. Every run from here
+        //    meanwhile. Every run from here that returns (one that a strict notice ends does not)
         //    ends by enabling those tasks and starting the auto-login ones that have no session
         //    (see `flow::repair_sessions`), which also heals what an earlier, killed `install` left;
         //    the agents start again afterwards, even if a later step fails, except in a session
@@ -316,10 +316,10 @@ mod imp {
 
     /// Write the system config from the shell sshd runs now, if it is not ssh-broker and there is no
     /// config yet (see [`system_config`]). Must run before the registry is overwritten. The install is
-    /// complete without the config, so a failure is said on stderr and `install` goes on; the
-    /// [`Handover`] it returns is what the flip takes. What `hand_over` prints when the config is not written is the
-    /// only record of the previous values: it is written strictly ([`show_to_console`]), and a write that fails
-    /// ends `install` before the flip. `previous` is what the registry holds now.
+    /// complete without the config, so a config that is not written does not fail `install`; the
+    /// [`Handover`] it returns is what the flip takes. What `hand_over` prints then is the only record of the
+    /// previous values: it is written strictly ([`show_to_console`]), and a write that fails ends `install`
+    /// before the flip. `previous` is what the registry holds now.
     fn carry_previous_shell(base: &layout::TrustedBase<'_>, previous: &SshdShell, say: &mut Say<'_>) -> Handover {
         let config = base.layout().system_config_path();
         let config_is_file = system_config::config_is_file(&config);
